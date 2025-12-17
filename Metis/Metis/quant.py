@@ -306,10 +306,7 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
             out = torch.where(zero_mask, torch.tensor(0.0, dtype=out.dtype, device=out.device), out)
 
             return out
-        
-        
-        # s = simulate_e4m3fn(s)     
-        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)   
+        s = simulate_e4m3fn(s)        
         
         s *= smax / 448
         
@@ -422,10 +419,7 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
             out = torch.where(zero_mask, torch.tensor(0.0, dtype=out.dtype, device=out.device), out)
 
             return out
-        
-        # s = simulate_e4m3fn(s) 
-        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)   
-       
+        s = simulate_e4m3fn(s)        
         
         s *= smax / 448
         
