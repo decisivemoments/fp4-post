@@ -59,6 +59,8 @@ python trl/scripts/dpo.py \
     --lora_alpha 16
 ```
 """
+import json
+from pathlib import Path
 
 import argparse
 import os
@@ -93,6 +95,7 @@ def main(script_args, training_args, model_args, dataset_args):
     # Model
     ###################
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    print(f"Loading model with dtype: {dtype}")
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -107,6 +110,9 @@ def main(script_args, training_args, model_args, dataset_args):
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
+    print(f"Model dtype after loading: {model.dtype}")
+    print(f"First parameter dtype: {next(model.parameters()).dtype}")
+    print(f"FSDP mixed_precision: {training_args.fsdp_config.get('mixed_precision', 'Not set')}")
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_model = AutoModelForCausalLM.from_pretrained(
@@ -145,6 +151,52 @@ def main(script_args, training_args, model_args, dataset_args):
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=peft_config,
     )
+    # --- 2. 检查 DPOTrainer 初始化后的内部模型精度 ---
+    print("\n--- Trainer Initialization Information ---")
+    # 获取 trainer 内部模型（可能经过 FSDP 包装）
+    internal_model = trainer.model
+    try:
+        # 打印第一个参数作为整体参考
+        first_internal_param_name, first_internal_param = next(internal_model.named_parameters())
+        print(f"After DPOTrainer Init - Internal model param dtype: {first_internal_param.dtype} on device: {first_internal_param.device}")
+        print(f"After DPOTrainer Init - First internal parameter name: {first_internal_param_name}")
+
+        # 定义你想检查的特定参数名称列表
+        target_param_names = [
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+        ]
+
+        # 遍历模型参数，查找并打印目标参数的类型
+        print("\nSpecific Linear Layer Parameter dtypes:")
+        found_params = set()
+        for name, param in internal_model.named_parameters():
+            if name in target_param_names:
+                print(f"  {name}: {param.dtype}")
+                found_params.add(name)
+                # 可选：如果找到了所有目标参数，可以提前退出循环
+                # if len(found_params) == len(target_param_names):
+                #     break
+        
+        # 检查是否有目标参数没有找到
+        missing_params = set(target_param_names) - found_params
+        if missing_params:
+            print(f"\nWarning: Could not find parameters: {missing_params}")
+
+
+        print(f"Original model dtype (before trainer init): {model.dtype}") # 这里打印原始模型加载时的 dtype
+    except StopIteration:
+        print("After DPOTrainer Init - Could not find parameters in the trainer's internal model.")
+
+    # 检查 Accelerator 的混合精度设置
+    print(f"After DPOTrainer Init - Accelerator Mixed Precision: {trainer.accelerator.mixed_precision}")
+    # print(f"After DPOTrainer Init - Accelerator State: {trainer.accelerator.state}") # 可选，信息可能较多
+    print("--- Trainer Initialization Information ---\n")
 
     # Train the model
     trainer.train()
@@ -183,4 +235,40 @@ if __name__ == "__main__":
     script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
         return_remaining_strings=True
     )
+    def print_and_save_args(args, name, output_dir=None):
+        print(f"\n{'='*80}")
+        print(f"📋 {name}")
+        print('='*80)
+        
+        args_dict = {}
+        if hasattr(args, '__dict__'):
+            for key, value in vars(args).items():
+                # 处理不可序列化的对象
+                try:
+                    json.dumps(value)
+                    args_dict[key] = value
+                except (TypeError, ValueError):
+                    args_dict[key] = str(value)
+                print(f"  {key:40s}: {value}")
+        else:
+            print(args)
+            args_dict = str(args)
+        
+        # 保存到文件
+        if output_dir:
+            output_path = Path(output_dir) / f"{name.lower().replace(' ', '_')}.json"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(args_dict, f, indent=2, ensure_ascii=False)
+            print(f"💾 Saved to: {output_path}")
+        
+        print('='*80)
+    
+    # 获取输出目录
+    output_dir = getattr(training_args, 'output_dir', 'Qwen2_5-0.5B-DPO')
+    
+    print_and_save_args(script_args, "Script Arguments", output_dir)
+    print_and_save_args(training_args, "Training Arguments", output_dir)
+    print_and_save_args(model_args, "Model Arguments", output_dir)
+    print_and_save_args(dataset_args, "Dataset Arguments", output_dir)
     main(script_args, training_args, model_args, dataset_args)

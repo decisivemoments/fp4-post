@@ -1,6 +1,5 @@
 export HF_ENDPOINT=https://hf-mirror.com
 
-# 使用 FSDP 配置
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
 accelerate launch --config_file fsdp.yaml dpo.py \
     --dataset_name /home/jyzhang/download/ultrafeedback_binarized \
@@ -13,7 +12,6 @@ accelerate launch --config_file fsdp.yaml dpo.py \
     --gradient_checkpointing False \
     --eval_strategy steps \
     --eval_steps 50 \
-    --output_dir Qwen2_5-0.5B-DPO \
-    --no_remove_unused_columns \
-    --fsdp "full_shard auto_wrap" \
-    --fsdp_transformer_layer_cls_to_wrap "Qwen2DecoderLayer"
+    --dtype bfloat16 \
+    --output_dir Qwen2_5-0.5B-DPO-bf16 \
+    --no_remove_unused_columns
