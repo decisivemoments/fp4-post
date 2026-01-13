@@ -1,1 +1,6 @@
 Qwen2_5-0.5B-DPO*
+tmp*
+train.log
+training_output.log
+.vscode/
+**/__pycache__

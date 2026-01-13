@@ -1,6 +1,6 @@
 export HF_ENDPOINT=https://hf-mirror.com
-CUDA_VISIBLE_DEVICES=0 \
-python  dpo.py \
+CUDA_VISIBLE_DEVICES=7 \
+python dpo_fp16.py \
     --dataset_name /inspire/hdd/project/yunweiyuhuifu/p-shangli/zxt/data/ultrafeedback_binarized \
     --model_name_or_path /inspire/hdd/project/yunweiyuhuifu/p-shangli/zxt/qwen2.5-0.5B-instruct \
     --learning_rate 5.0e-7 \
@@ -10,6 +10,7 @@ python  dpo.py \
     --gradient_checkpointing \
     --eval_strategy steps \
     --eval_steps 50 \
-    --dtype float32 \
-    --output_dir Qwen2_5-0.5B-DPO-fp32 \
-    --no_remove_unused_columns
+    --output_dir Qwen2_5-0.5B-DPO-fp16 \
+    --no_remove_unused_columns \
+    --bf16 False \
+    --fp16 True

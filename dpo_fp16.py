@@ -83,135 +83,100 @@ from trl import (
     get_quantization_config,
 )
 
-from transformers import TrainerCallback
+from typing import Any, Dict, List
+import torch
 
-class NaNDebugCallback(TrainerCallback):
-    """检测 NaN/Inf 的回调"""
+class PaddedDataCollatorForDPO:
+    """自定义 Data Collator for DPO,确保序列长度是 block_size 的倍数"""
     
-    def on_step_end(self, args, state, control, **kwargs):
-        # 检查 loss
-        if state.log_history:
-            last_log = state.log_history[-1]
-            if 'loss' in last_log:
-                loss = last_log['loss']
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"❌ NaN/Inf detected at step {state.global_step}, loss={loss}")
-                    control.should_training_stop = True
-                else:
-                    print(f"✅ Step {state.global_step}, loss={loss:.4f}")
-        return control
+    def __init__(self, tokenizer, block_size=16):
+        self.tokenizer = tokenizer
+        self.block_size = block_size
+        self.pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     
-    def on_log(self, args, state, control, logs=None, **kwargs):
-        if logs:
-            print(f"📊 Step {state.global_step} logs: {logs}")
-        return control
-
-def hook_function(module, input, output):
-    # print(f"Module name: {module.__class__.__name__}")
-    try:
-        if isinstance(input, tuple) :
-            for in_ in input:
-                if isinstance(in_, torch.Tensor):
- 
-                    if torch.isnan(in_).any():
-                        print(f"input shape: {in_.shape}")
-                        print(f"NaN detected before layer: {module.__class__.__name__}")
-        else: 
-            # print(f"input shape: {input.shape}")
-            # print("input stats - mean: {}, std: {}, min: {}, max: {}".format(
-            #     input.mean().item(), input.std().item(), input.min().item(), input.max().item()))
-            if torch.isnan(input).any():
-                print(f"input shape: {input.shape}")
-                print(f"NaN detected before layer: {module.__class__.__name__}")
-    except:
-        pass
-    
-    
-    try:
-        if isinstance(output, tuple) :
-            for out in output:
-                if isinstance(out, torch.Tensor):
- 
-                    if torch.isnan(out).any():
-                        print(f"Output shape: {out.shape}")
-                        print(f"NaN detected after layer: {module.__class__.__name__}")
-        else: 
-            # print(f"Output shape: {output.shape}")
-            # print("Output stats - mean: {}, std: {}, min: {}, max: {}".format(
-            #     output.mean().item(), output.std().item(), output.min().item(), output.max().item()))
-            if torch.isnan(output).any():
-                print(f"Output shape: {out.shape}")
-                print(f"NaN detected after layer: {module.__class__.__name__}")
-    except:
-        pass
-    
-    for name, param in module.named_parameters():
-        if torch.isnan(param).any() or torch.isinf(param).any():
-            print(f"NaN detected in layer param: {module.__class__.__name__}")
-            print(f"Parameter {name} has NaN or Inf values")
-
-def backward_hook_function(module, grad_input, grad_output):
-    """反向传播钩子：监控梯度"""
-    module_name = module.__class__.__name__
-    
-    # 检查输入梯度
-    if grad_input is not None:
-        for i, grad in enumerate(grad_input):
-            if grad is not None and isinstance(grad, torch.Tensor):
-                if torch.isnan(grad).any() or torch.isinf(grad).any():
-                    print(f"❌ NaN/Inf in grad_input[{i}] of {module_name}")
-                    print(f"   Shape: {grad.shape}")
-                    print(f"   Stats: min={grad.min():.4f}, max={grad.max():.4f}, mean={grad.mean():.4f}")
-                    # 打印模块的详细信息
-                    print(f"   Module: {module}")
-    
-    # 检查输出梯度
-    if grad_output is not None:
-        for i, grad in enumerate(grad_output):
-            if grad is not None and isinstance(grad, torch.Tensor):
-                if torch.isnan(grad).any() or torch.isinf(grad).any():
-                    print(f"❌ NaN/Inf in grad_output[{i}] of {module_name}")
-                    print(f"   Shape: {grad.shape}")
-                    print(f"   Stats: min={grad.min():.4f}, max={grad.max():.4f}, mean={grad.mean():.4f}")
-                    print(f"   Module: {module}")
-
-def pre_backward_hook(module, grad_output):
-    """反向传播前钩子：在模块反向传播开始前检查梯度"""
-    module_name = module.__class__.__name__
-    
-    # 检查从上游传来的梯度
-    if grad_output is not None:
-        for i, grad in enumerate(grad_output):
-            if grad is not None and isinstance(grad, torch.Tensor):
-                if torch.isnan(grad).any() or torch.isinf(grad).any():
-                    print(f"❌ Pre-backward: NaN/Inf in grad_output[{i}] of {module_name}")
-                    print(f"   Shape: {grad.shape}")
-                    print(f"   Stats: min={grad.min():.4f}, max={grad.max():.4f}, mean={grad.mean():.4f}")
-                    print(f"   Module: {module}")
-                else:
-                    print(f"✅ Pre-backward: grad_output[{i}] of {module_name} - OK")
-                    print(f"   Shape: {grad.shape}")
-                    print(f"   Stats: min={grad.min():.4f}, max={grad.max():.4f}, mean={grad.mean():.4f}")
+    def _pad_to_multiple(self, tensor: torch.Tensor, target_length: int, pad_value: int) -> torch.Tensor:
+        """将 tensor pad 到指定长度"""
+        if len(tensor) >= target_length:
+            return tensor[:target_length]
         
-class ModelWrapper:
-    def __init__(self, model):
-        self.model = model
-        self.hooks = []
- 
-    def register_hooks(self):
-        # 遍历预训练模型的所有模块，为它们注册前向钩子
-        for name, module in self.model.named_modules():
-            if isinstance(module, torch.nn.Module):  # 确保是模块，而非其他（如参数）
-                self.hooks.append(module.register_forward_hook(hook_function))
-                self.hooks.append(module.register_full_backward_hook(backward_hook_function))
-                self.hooks.append(module.register_full_backward_pre_hook(pre_backward_hook))
- 
-    def remove_hooks(self):
-        # 移除之前注册的所有钩子
-        for hook in self.hooks:
-            hook.remove()
- 
-
+        padding_length = target_length - len(tensor)
+        padding = torch.full((padding_length,), pad_value, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat([tensor, padding])
+    
+    def _get_padded_length(self, length: int) -> int:
+        """计算 pad 后的长度(向上取整到 block_size 的倍数)"""
+        return ((length + self.block_size - 1) // self.block_size) * self.block_size
+    
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        # 定义需要处理的键组
+        key_groups = {
+            'prompt': ('prompt_input_ids', 'prompt_attention_mask'),
+            'chosen': ('chosen_input_ids', 'chosen_attention_mask'),
+            'rejected': ('rejected_input_ids', 'rejected_attention_mask'),
+        }
+        
+        batch = {}
+        
+        # 处理每组键
+        for group_name, (input_ids_key, attention_mask_key) in key_groups.items():
+            # 检查第一个 feature 是否包含这些键
+            if input_ids_key not in features[0]:
+                continue
+            
+            # 找到这组中最长的序列
+            max_length = max(len(feature[input_ids_key]) for feature in features)
+            
+            # 向上取整到 block_size 的倍数
+            padded_length = self._get_padded_length(max_length)
+            
+            # 收集并 pad 所有样本
+            input_ids_list = []
+            attention_mask_list = []
+            
+            for feature in features:
+                # 处理 input_ids
+                input_ids = feature[input_ids_key]
+                if not isinstance(input_ids, torch.Tensor):
+                    input_ids = torch.tensor(input_ids, dtype=torch.long)
+                
+                padded_input_ids = self._pad_to_multiple(input_ids, padded_length, self.pad_token_id)
+                input_ids_list.append(padded_input_ids)
+                
+                # 处理或生成 attention_mask
+                if attention_mask_key in feature:
+                    attention_mask = feature[attention_mask_key]
+                    if not isinstance(attention_mask, torch.Tensor):
+                        attention_mask = torch.tensor(attention_mask, dtype=torch.long)
+                else:
+                    # 如果没有 attention_mask,根据 input_ids 生成
+                    attention_mask = torch.ones(len(input_ids), dtype=torch.long)
+                
+                padded_attention_mask = self._pad_to_multiple(attention_mask, padded_length, 0)
+                attention_mask_list.append(padded_attention_mask)
+            
+            # 堆叠成 batch
+            batch[input_ids_key] = torch.stack(input_ids_list)
+            batch[attention_mask_key] = torch.stack(attention_mask_list)
+        
+        # 处理其他可能的键(如 labels, pixel_values 等)
+        for key in features[0].keys():
+            if key not in batch:
+                # 对于非序列数据,直接收集
+                if isinstance(features[0][key], (int, float, str, bool)):
+                    batch[key] = [feature[key] for feature in features]
+                elif isinstance(features[0][key], torch.Tensor):
+                    batch[key] = torch.stack([feature[key] for feature in features])
+                else:
+                    batch[key] = [feature[key] for feature in features]
+        
+        print("\n=== Data Collator Debug ===")
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                print(f"{key}: shape={value.shape}")
+        print(f"Padded to multiple of {self.block_size}")
+        print("===========================\n")
+        
+        return batch
 
 
 logger = logging.get_logger(__name__)
@@ -240,13 +205,18 @@ def main(script_args, training_args, model_args, dataset_args):
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
-    wrapper = ModelWrapper(model)
-    # 注册钩子
-    wrapper.register_hooks()
-    
     print(f"Model dtype after loading: {model.dtype}")
     print(f"First parameter dtype: {next(model.parameters()).dtype}")
     print(f"FSDP mixed_precision: {training_args.fsdp_config.get('mixed_precision', 'Not set')}")
+    
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        trust_remote_code=model_args.trust_remote_code
+    )
+    
+    # 创建自定义 data collator
+    data_collator = PaddedDataCollatorForDPO(tokenizer, block_size=16)
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_model = AutoModelForCausalLM.from_pretrained(
@@ -284,7 +254,7 @@ def main(script_args, training_args, model_args, dataset_args):
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=peft_config,
-        # callbacks=[NaNDebugCallback()]
+        # data_collator=data_collator,
     )
     # --- 2. 检查 DPOTrainer 初始化后的内部模型精度 ---
     print("\n--- Trainer Initialization Information ---")
@@ -367,16 +337,13 @@ if __name__ == "__main__":
     # When using the trl cli, this script may be run with additional arguments, corresponding accelerate arguments.
     # To ensure that their parsing does not interfere with the script arguments, parse the arguments with
     # `return_remaining_strings=True`, then ignore the remaining strings.
+    os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
     script_args, training_args, model_args, dataset_args, _ = parser.parse_args_and_config(
         return_remaining_strings=True
     )
-    training_args.bf16 = False
-    training_args.tf32 = False
-    os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+    os.environ["ACCELERATE_MIXED_PRECISION"] = "fp16"
     def print_and_save_args(args, name, output_dir=None):
-        print(f"\n{'='*80}")
-        print(f"📋 {name}")
-        print('='*80)
+
         
         args_dict = {}
         if hasattr(args, '__dict__'):
@@ -387,9 +354,7 @@ if __name__ == "__main__":
                     args_dict[key] = value
                 except (TypeError, ValueError):
                     args_dict[key] = str(value)
-                print(f"  {key:40s}: {value}")
         else:
-            print(args)
             args_dict = str(args)
         
         # 保存到文件
@@ -400,7 +365,6 @@ if __name__ == "__main__":
                 json.dump(args_dict, f, indent=2, ensure_ascii=False)
             print(f"💾 Saved to: {output_path}")
         
-        print('='*80)
     
     # 获取输出目录
     output_dir = getattr(training_args, 'output_dir', 'Qwen2_5-0.5B-DPO')
