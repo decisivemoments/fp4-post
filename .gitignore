@@ -4,3 +4,5 @@ train.log
 training_output.log
 .vscode/
 **/__pycache__
+**/activation_analysis
+pic/

@@ -72,6 +72,9 @@ def analyze_and_plot_matrices(data_list, k, beta):
         V_k = V[:, :k]
         S_k_diag = torch.diag(S_k)
         reduced_X = U_k @ S_k_diag @ V_k.T
+
+        # 计算投影矩阵 X_proj = X @ V_momentum @ V_momentum^T
+        projected_X = original_X @ momentum_v @ momentum_v.T
         
         # 更新动量V
         current_v_k = V[:, :k]
@@ -81,9 +84,6 @@ def analyze_and_plot_matrices(data_list, k, beta):
         current_v_aligned = current_v_k * sign_correction
         momentum_v = momentum_v * beta + current_v_aligned * (1 - beta)
         momentum_v = torch.nn.functional.normalize(momentum_v, dim=0)
-        
-        # 计算投影矩阵 X_proj = X @ V_momentum @ V_momentum^T
-        projected_X = original_X @ momentum_v @ momentum_v.T
         
         # 绘制三个矩阵的绝对值分布直方图
         plot_matrix_abs_distribution(original_X, reduced_X, projected_X, step_idx, k)
@@ -282,12 +282,12 @@ def compute_V_cos_sim_with_last_V(data_list):
 # 使用示例
 if __name__ == "__main__":
     # 替换为你的 .pt 文件路径
-    # pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_0_self_attn_q_proj_deltas_rank0.pt"
-    # pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_11_self_attn_q_proj_deltas_rank0.pt"
-    # pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_23_self_attn_q_proj_deltas_rank0.pt"
-    # pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_0_self_attn_q_proj_snapshots_rank7.pt"
-    # pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_11_self_attn_q_proj_snapshots_rank7.pt"
-    pt_file_path = "/home/jyzhang/pro/trl_run/grpo/activation_analysis/model_layers_23_self_attn_q_proj_snapshots_rank7.pt"
+    # pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_0_self_attn_q_proj_deltas_rank0.pt"
+    # pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_11_self_attn_q_proj_deltas_rank0.pt"
+    # pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_23_self_attn_q_proj_deltas_rank0.pt"
+    # pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_0_self_attn_q_proj_snapshots_rank7.pt"
+    # pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_11_self_attn_q_proj_snapshots_rank7.pt"
+    pt_file_path = "/home/jyzhang/trl_run_data/activation_analysis/model_layers_23_self_attn_q_proj_snapshots_rank7.pt"
     
     if os.path.exists(pt_file_path):
         analyze_pt_file(pt_file_path)

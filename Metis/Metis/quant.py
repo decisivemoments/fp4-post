@@ -240,7 +240,8 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
         s /= smax / 448
         
         """Use torch.float8_e4m3fn"""
-        # s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)
+        original_dtype = s.dtype
+        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=original_dtype)
         """Use similated float8_e4m3fn"""
         def simulate_e4m3fn(x: torch.Tensor):
             """
@@ -306,7 +307,7 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
             out = torch.where(zero_mask, torch.tensor(0.0, dtype=out.dtype, device=out.device), out)
 
             return out
-        s = simulate_e4m3fn(s)        
+        # s = simulate_e4m3fn(s)        
         
         s *= smax / 448
         
@@ -324,6 +325,8 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
         brows = BlockQuantFunc.block_shape[0]
         bcols = BlockQuantFunc.block_shape[1]
         
+        if rows % brows != 0 or cols % bcols != 0 :
+            print(rows, cols, brows, bcols)
         assert(rows % brows == 0 and cols % bcols == 0)
         
         x = x.abs() \
@@ -353,7 +356,8 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
         s /= smax / 448
         
         """Use torch.float8_e4m3fn"""
-        # s = s.to(dtype=torch.float8_e4m3fn).to(dtype=torch.float32)
+        original_dtype = s.dtype
+        s = s.to(dtype=torch.float8_e4m3fn).to(dtype=original_dtype)
         """Use similated float8_e4m3fn"""
         def simulate_e4m3fn(x: torch.Tensor):
             """
@@ -419,7 +423,7 @@ class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
             out = torch.where(zero_mask, torch.tensor(0.0, dtype=out.dtype, device=out.device), out)
 
             return out
-        s = simulate_e4m3fn(s)        
+        # s = simulate_e4m3fn(s)      
         
         s *= smax / 448
         

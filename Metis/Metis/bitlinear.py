@@ -1,12 +1,12 @@
 from .quant import *
 import torch.nn as nn
 import torch.nn.init as init
-import transformer_engine.pytorch  as te
+# import transformer_engine.pytorch  as te
 
 from functools import partial
 
 import math
-from scipy.linalg import hadamard
+# from scipy.linalg import hadamard
 
 # -----------------------------------------------------------------------------
 # Core autograd.Function implementing low-bit GEMM with optional Spectral Decomposition
@@ -47,6 +47,8 @@ class LinearLowbitFunction(torch.autograd.Function):
     
     tp_simulate = False
     tp_parts = 4
+    
+    compute_dtype = torch.float32
     
     # # ------------------------------------------------------------------
     # # Spectral Decomposition for a matrix
@@ -202,15 +204,23 @@ class LinearLowbitFunction(torch.autograd.Function):
                 cinput_flat = cinput
                 input_flat = chunk
 
+            original_dtype = cinput_flat.dtype
+            cinput_flat_fp32 = cinput_flat.to(torch.float32)
+            if torch.isnan(cinput_flat_fp32).any() or torch.isinf(cinput_flat_fp32).any():
+                print(f"⚠️ Warning: NaN or Inf detected in input before SVD")
             # --- 低秩 SVD ---
-            ug, sg, vg = torch.svd_lowrank(
-                cinput_flat,
-                q=rank,
-                niter=niter,
-            )
-
+            with torch.amp.autocast(cinput_flat_fp32.device.type, enabled=False):
+                ug, sg, vg = torch.svd_lowrank(
+                    cinput_flat_fp32,
+                    q=rank,
+                    niter=niter,
+                )
+            ug = ug.to(original_dtype)
+            sg = sg.to(original_dtype)
+            vg = vg.to(original_dtype)
+            
             vg = vg.T
-            ug = ug.T
+            # ug = ug.T
 
             # --- 量化 U、V ---
             ug_scalar = quant_func.get_scalar(ug)
@@ -223,7 +233,7 @@ class LinearLowbitFunction(torch.autograd.Function):
             vg = quant_func.rquant(vg, vg_scalar)
 
             # --- 重建低秩核 ker ---
-            ker = (ug.T @ torch.diag(sg) @ vg)
+            ker = (ug @ torch.diag(sg) @ vg)
 
             # --- 如果之前在某个维度 select 了一个切片，这里再 unsqueeze 回去 ---
             if did_select_broadcast_dim:
@@ -273,7 +283,8 @@ class LinearLowbitFunction(torch.autograd.Function):
     
     @staticmethod
     def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
-        
+        input_original_dtype = input_.dtype
+        input_ = input_.to(LinearLowbitFunction.compute_dtype)
         
         wdim = weight.shape[-1]
         idim = input_.shape[-1]
@@ -330,7 +341,7 @@ class LinearLowbitFunction(torch.autograd.Function):
         if bias is not None:
             output += bias
         
-        
+        output.to(input_original_dtype)
         return output
     
     @staticmethod
@@ -342,6 +353,8 @@ class LinearLowbitFunction(torch.autograd.Function):
         # input_ = LinearLowbitFunction.q_backward_input.rquant(input_, input_scalar)
         # weight = LinearLowbitFunction.q_backward_weight.rquant(weight, weight_scalar)
         
+        grad_original_dtype = grad_output.dtype
+        grad_output = grad_output.to(LinearLowbitFunction.compute_dtype)
         
         grad_bias = grad_output.sum(dim=(0, 1)) if bias is not None else None
         
@@ -398,6 +411,9 @@ class LinearLowbitFunction(torch.autograd.Function):
         grad_output = grad_output.T.reshape(grad_output_shape0, grad_output_shape1, grad_output_shape2)
         grad_input = torch.matmul(grad_output, weight)                    
         
+        grad_weight = grad_weight.to(torch.float32)
+        grad_bias = grad_bias.to(torch.float32) if grad_bias is not None else None
+        
         return grad_input, grad_weight, grad_bias
 
 class LinearLowbit(torch.nn.Module):
@@ -407,17 +423,21 @@ class LinearLowbit(torch.nn.Module):
         out_features: int, 
         bias=True,
         args=None, 
-        device=None
+        device=None,
+        storage_dtype = torch.float32,
+        compute_dtype = torch.float32
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.storage_dtype = storage_dtype
+        self.compute_dtype = compute_dtype
         self.weight = torch.nn.Parameter(
-            torch.empty((out_features, in_features), dtype=torch.float32, device=args.device if device is None else device)
+            torch.empty((out_features, in_features), dtype=storage_dtype, device=args.device if device is None else device)
         )
         if bias:
             self.bias = torch.nn.Parameter(
-                torch.empty((out_features,), dtype=torch.float32, device=args.device if device is None else device)
+                torch.empty((out_features,), dtype=storage_dtype, device=args.device if device is None else device)
             )
         else:
             self.bias = None
@@ -431,7 +451,9 @@ class LinearLowbit(torch.nn.Module):
             init.uniform_(self.bias, -bound, bound)
     
     def forward(self, input):
-        return LinearLowbitFunction.apply(input, self.weight, self.bias)
+        weight_compute = self.weight.to(self.compute_dtype)
+        bias_compute = self.bias.to(self.compute_dtype) if self.bias is not None else None
+        return LinearLowbitFunction.apply(input, weight_compute, bias_compute)
 
     pass
 
@@ -441,16 +463,25 @@ class BitLinear(nn.Module):
         in_features, 
         out_features,
         args=None,
-        bias=True
+        bias=True,
+        dtype = torch.float32,
+        compute_dtype = None
     ):
         super().__init__()
+        self.storage_dtype = dtype  # 权重存储精度（fp32）
+        self.compute_dtype = compute_dtype if compute_dtype is not None else dtype  # 计算精度（fp16/bf16）
+        
+        # 验证 compute_dtype 的合法性
+        if self.compute_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+            raise ValueError(f"Unsupported compute_dtype: {self.compute_dtype}")
+        
         if args.enable_forward_svd == False and args.enable_lowbit == True:
             if args.enable_te:
                 self.warmup_linear = te.Linear(in_features, out_features, device=args.device)
             else:
-                self.warmup_linear = LinearLowbit(in_features, out_features, bias=bias, args=args)
+                self.warmup_linear = LinearLowbit(in_features, out_features, bias=bias, args=args, storage_dtype = self.storage_dtype, compute_dtype = self.compute_dtype)
         else:
-            self.warmup_linear = nn.Linear(in_features, out_features, bias=bias, device=args.device)
+            self.warmup_linear = nn.Linear(in_features, out_features, bias=bias, device=args.device, dtype=self.storage_dtype)
             init.kaiming_uniform_(self.warmup_linear.weight, a=math.sqrt(5))
             if bias:
                 fan_in, _ = init._calculate_fan_in_and_fan_out(self.warmup_linear.weight)
@@ -481,7 +512,7 @@ class BitLinear(nn.Module):
         
         LinearLowbitFunction.tp_simulation = args.tp_simulation
         LinearLowbitFunction.tp_parts = args.tp_parts
-        
+        LinearLowbitFunction.compute_dtype = self.compute_dtype
         
         
 
@@ -500,7 +531,7 @@ class BitLinear(nn.Module):
             y = torch.mul(self.s, y)
             y = self.ulinear(y)
             if self.args.forward_svd_rank > 0:
-                y += self.warmup_linear(x)
+                y = y + self.warmup_linear(x)
             
             
         else:
@@ -530,10 +561,16 @@ class BitLinear(nn.Module):
             device = self.ulinear.weight.device
         else:
             device = self.warmup_linear.weight.device
-            u, s, v = torch.linalg.svd(self.warmup_linear.weight, full_matrices=False)
-            u = u.cuda(self.warmup_linear.weight.get_device())
-            s = s.cuda(self.warmup_linear.weight.get_device())
-            v = v.cuda(self.warmup_linear.weight.get_device())
+            original_dtype = self.warmup_linear.weight.dtype  # 保存原始数据类型
+
+            # 提升到 float32 进行 SVD 计算
+            weight_fp32 = self.warmup_linear.weight.to(torch.float32)
+            u, s, v = torch.linalg.svd(weight_fp32, full_matrices=False)
+
+            # 将结果转换回原始数据类型
+            u = u.to(original_dtype).cuda(self.warmup_linear.weight.get_device())
+            s = s.to(original_dtype).cuda(self.warmup_linear.weight.get_device())
+            v = v.to(original_dtype).cuda(self.warmup_linear.weight.get_device())
             
             if not self.warmup_linear.bias is None:
                 bias = self.warmup_linear.bias.to(device=device)
@@ -547,6 +584,8 @@ class BitLinear(nn.Module):
                     self.warmup_linear.weight.shape[0],
                     bias=True if not bias is None else False, 
                     args=self.args,
+                    storage_dtype = original_dtype,
+                    compute_dtype=self.compute_dtype
                     # device=device
                 )
                 if not bias is None:
@@ -597,13 +636,17 @@ class BitLinear(nn.Module):
                     self.args.forward_svd_rank, # v.shape[0] // 30, 
                     bias=False, 
                     args=self.args,
+                    storage_dtype=original_dtype,
+                    compute_dtype=self.compute_dtype
                     # device=device
                 )
                 self.ulinear = LinearLowbit(
                     self.args.forward_svd_rank, # u.shape[1] // 30, 
                     u.shape[0], 
                     bias=False,
-                    args=self.args
+                    args=self.args,
+                    storage_dtype=original_dtype,
+                    compute_dtype=self.compute_dtype
                     # device=device
                 )
                 self.vlinear.weight.copy_(v[: self.args.forward_svd_rank, :])
