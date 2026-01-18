@@ -49,6 +49,7 @@ class LinearLowbitFunction(torch.autograd.Function):
     tp_parts = 4
     
     compute_dtype = torch.float32
+    need_rollout = False
     
     # # ------------------------------------------------------------------
     # # Spectral Decomposition for a matrix
@@ -282,7 +283,7 @@ class LinearLowbitFunction(torch.autograd.Function):
 
     
     @staticmethod
-    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, module_ref=None):  # 新增：传入模块引用
         input_original_dtype = input_.dtype
         input_ = input_.to(LinearLowbitFunction.compute_dtype)
         
@@ -295,15 +296,26 @@ class LinearLowbitFunction(torch.autograd.Function):
         
 
         if LinearLowbitFunction.enable_activation_svd:
-            input_ = LinearLowbitFunction.svd_quant(
-                input_, 
-                quant_func=LinearLowbitFunction.q_forward_input,
-                rank=LinearLowbitFunction.activation_lowrank_svd,
-                niter=LinearLowbitFunction.activation_lowrank_niter,
-                broadcast_dim=LinearLowbitFunction.activation_broadcast_dim,
-                tp_simulate=LinearLowbitFunction.tp_simulate,
-                tp_parts=LinearLowbitFunction.tp_parts,
-            )
+            if module_ref is not None and hasattr(module_ref, 'momentum_v'):
+                # 使用动量V进行投影分解
+                input_ = LinearLowbitFunction._project_and_quant_with_momentum(
+                    input_, module_ref, 
+                    quant_func=LinearLowbitFunction.q_forward_input,
+                    rank=LinearLowbitFunction.activation_lowrank_svd,
+                    niter=LinearLowbitFunction.activation_lowrank_niter,
+                    beta=module_ref.momentum_beta if hasattr(module_ref, 'momentum_beta') else 0.9
+                )
+            else:
+                # 原始的 SVD 量化路径（兼容旧代码）
+                input_ = LinearLowbitFunction.svd_quant(
+                    input_, 
+                    quant_func=LinearLowbitFunction.q_forward_input,
+                    rank=LinearLowbitFunction.activation_lowrank_svd,
+                    niter=LinearLowbitFunction.activation_lowrank_niter,
+                    broadcast_dim=LinearLowbitFunction.activation_broadcast_dim,
+                    tp_simulate=LinearLowbitFunction.tp_simulate,
+                    tp_parts=LinearLowbitFunction.tp_parts,
+                )
             input_scalar = LinearLowbitFunction.q_forward_input.get_scalar(input_)
         else:
             
@@ -319,7 +331,7 @@ class LinearLowbitFunction(torch.autograd.Function):
         
         if LinearLowbitFunction.enable_nv_recipe:
             weight = weight @ LinearLowbitFunction.h[: wdim]
-        weight_scalar = LinearLowbitFunction.q_forward_input.get_scalar(weight)
+        weight_scalar = LinearLowbitFunction.q_forward_weight.get_scalar(weight)
         weight = LinearLowbitFunction.q_forward_weight.quant(weight, weight_scalar)
         weight = LinearLowbitFunction.q_forward_weight.rquant(weight, weight_scalar)
         if LinearLowbitFunction.enable_nv_recipe:
@@ -341,7 +353,105 @@ class LinearLowbitFunction(torch.autograd.Function):
         if bias is not None:
             output += bias
         
-        output.to(input_original_dtype)
+        return output.to(input_original_dtype)
+    
+    @staticmethod
+    def _project_and_quant_with_momentum(
+        input_: torch.Tensor,
+        module_ref,
+        quant_func,
+        rank: int = 60,
+        niter: int = 0,
+        beta: float = 0.9
+    ):
+        """
+        使用动量V进行投影分解 + 量化
+        
+        流程：
+        1. 如果 requires_grad=True，执行 SVD 并更新 momentum_v
+        2. 使用 momentum_v 投影得到 main 和 residual
+        3. 分别量化 main 和 residual
+        4. 重构返回
+        """
+        original_shape = input_.shape
+        device = input_.device
+        dtype = input_.dtype
+        
+        did_select_broadcast_dim = False
+        if LinearLowbitFunction.activation_broadcast_dim >= 0:
+            cinput = input_.select(LinearLowbitFunction.activation_broadcast_dim, 0)
+            did_select_broadcast_dim = True
+        else:
+            cinput = input_
+        
+        # 展平为 2D: (B*T, D)
+        if len(original_shape) == 3:
+            input_flat = input_.reshape(-1, original_shape[-1])
+        else:
+            input_flat = input_
+        
+        B_flat, D = input_flat.shape
+
+        # ========== Step 1: 使用 momentum_v 进行投影分解 ==========
+        if module_ref.momentum_v is None:
+            # 如果还没有 momentum_v（第一次 inference），直接量化
+            input_scalar = quant_func.get_scalar(input_flat)
+            input_quant = quant_func.quant(input_flat, input_scalar)
+            output = quant_func.rquant(input_quant, input_scalar)
+        else:
+            momentum_v = module_ref.momentum_v  # (D, rank)
+            
+            # 投影到主空间: X_main = X @ V @ V^T
+            proj_main = input_flat @ momentum_v @ momentum_v.T  # (B*T, D)
+            
+            # 残差: X_res = X - X_main
+            residual = input_flat - proj_main
+            
+            # ========== Step 3: 分别量化 ==========
+            # 量化 main
+            main_scalar = quant_func.get_scalar(proj_main)
+            proj_main_q = quant_func.quant(proj_main, main_scalar)
+            proj_main_dq = quant_func.rquant(proj_main_q, main_scalar)
+            
+            # 量化 residual
+            res_scalar = quant_func.get_scalar(residual)
+            residual_q = quant_func.quant(residual, res_scalar)
+            residual_dq = quant_func.rquant(residual_q, res_scalar)
+            
+            # ========== Step 4: 重构 ==========
+            output = proj_main_dq + residual_dq
+        
+        # ========== Step 2: 如果需要梯度，执行 SVD 并更新 momentum_v ==========
+        if input_.requires_grad and module_ref.training:
+            # SVD 分解（使用 fp32 提高数值稳定性）
+            input_fp32 = cinput.to(torch.float32)
+            with torch.amp.autocast(input_fp32.device.type, enabled=False):
+                U, S, V = torch.svd_lowrank(input_fp32, q=rank, niter=niter)
+            V_k = V[:, :rank]  # (D, rank)
+            
+            # 初始化或更新 momentum_v
+            if module_ref.momentum_v is None:
+                module_ref.momentum_v = V_k.to(dtype).to(device)
+            else:
+                # 符号对齐
+                current_v = V_k.to(dtype).to(device)
+                old_v = module_ref.momentum_v
+                
+                dot_products = (old_v * current_v).sum(dim=0)
+                sign_correction = torch.sign(dot_products)
+                current_v_aligned = current_v * sign_correction
+                
+                # 动量更新
+                module_ref.momentum_v = beta * old_v + (1 - beta) * current_v_aligned
+                # 重新正交化
+                module_ref.momentum_v = torch.nn.functional.normalize(module_ref.momentum_v, dim=0)
+        
+
+        
+        # 还原形状
+        if len(original_shape) == 3:
+            output = output.view(original_shape)
+        
         return output
     
     @staticmethod
@@ -414,7 +524,7 @@ class LinearLowbitFunction(torch.autograd.Function):
         grad_weight = grad_weight.to(torch.float32)
         grad_bias = grad_bias.to(torch.float32) if grad_bias is not None else None
         
-        return grad_input, grad_weight, grad_bias
+        return grad_input, grad_weight, grad_bias, None  # 最后的 None 对应 module_ref
 
 class LinearLowbit(torch.nn.Module):
     def __init__(
@@ -424,14 +534,20 @@ class LinearLowbit(torch.nn.Module):
         bias=True,
         args=None, 
         device=None,
-        storage_dtype = torch.float32,
-        compute_dtype = torch.float32
+        storage_dtype=torch.float32,
+        compute_dtype=torch.float32,
+        need_rollout=False,
+        momentum_beta=0.9,
     ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.storage_dtype = storage_dtype
         self.compute_dtype = compute_dtype
+        self.momentum_beta = momentum_beta
+        self.need_rollout = need_rollout
+        
+        # 权重参数
         self.weight = torch.nn.Parameter(
             torch.empty((out_features, in_features), dtype=storage_dtype, device=args.device if device is None else device)
         )
@@ -441,6 +557,11 @@ class LinearLowbit(torch.nn.Module):
             )
         else:
             self.bias = None
+        
+        # ========== 关键修改：注册 momentum_v 为 buffer ==========
+        # buffer 不参与梯度计算，但会被保存到 state_dict
+        self.register_buffer('momentum_v', None)
+        
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -449,11 +570,19 @@ class LinearLowbit(torch.nn.Module):
             fan_in, _ = init._calculate_fan_in_and_fan_out(self.weight)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
-    
+
     def forward(self, input):
         weight_compute = self.weight.to(self.compute_dtype)
         bias_compute = self.bias.to(self.compute_dtype) if self.bias is not None else None
-        return LinearLowbitFunction.apply(input, weight_compute, bias_compute)
+        
+        # ========== 关键修改：传入 self 引用 ==========
+        return LinearLowbitFunction.apply(
+            input, 
+            weight_compute, 
+            bias_compute,
+            self if self.need_rollout else None  # 只有需要 rollout 时才传入
+        )
+
 
     pass
 
@@ -513,6 +642,8 @@ class BitLinear(nn.Module):
         LinearLowbitFunction.tp_simulation = args.tp_simulation
         LinearLowbitFunction.tp_parts = args.tp_parts
         LinearLowbitFunction.compute_dtype = self.compute_dtype
+        self.need_rollout = args.need_rollout
+        self.momentum_beta = args.momentum_beta
         
         
 
@@ -585,7 +716,9 @@ class BitLinear(nn.Module):
                     bias=True if not bias is None else False, 
                     args=self.args,
                     storage_dtype = original_dtype,
-                    compute_dtype=self.compute_dtype
+                    compute_dtype=self.compute_dtype,
+                    need_rollout=self.need_rollout,
+                    momentum_beta=self.momentum_beta
                     # device=device
                 )
                 if not bias is None:
@@ -637,7 +770,9 @@ class BitLinear(nn.Module):
                     bias=False, 
                     args=self.args,
                     storage_dtype=original_dtype,
-                    compute_dtype=self.compute_dtype
+                    compute_dtype=self.compute_dtype,
+                    need_rollout=self.need_rollout,
+                    momentum_beta=self.momentum_beta
                     # device=device
                 )
                 self.ulinear = LinearLowbit(
@@ -646,7 +781,9 @@ class BitLinear(nn.Module):
                     bias=False,
                     args=self.args,
                     storage_dtype=original_dtype,
-                    compute_dtype=self.compute_dtype
+                    compute_dtype=self.compute_dtype,
+                    need_rollout=self.need_rollout,
+                    momentum_beta=self.momentum_beta
                     # device=device
                 )
                 self.vlinear.weight.copy_(v[: self.args.forward_svd_rank, :])

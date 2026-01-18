@@ -110,7 +110,10 @@ def parse():
     parser.add_argument("--reg-alpha2", type=float, default=1.0)
     parser.add_argument("--reg-lambda", type=float, default=0.0)
     parser.add_argument("--reg-beta", type=int, default=2)
-    
+
+    parser.add_argument("--need_rollout", type=bool, default=False)
+    parser.add_argument("--momentum_beta", type=float, default=0.9)
+
 
     # gpt config
     parser.add_argument("--embed-dim", type=int, default=768)
