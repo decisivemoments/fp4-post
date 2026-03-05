@@ -100,13 +100,8 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
     if compute_dtype is None:
         compute_dtype = torch.float32
     
-    # 🔥 导入 DeepSpeed 工具
-    from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
-    import deepspeed
-    
     for name, module in model.named_children():
         if len(list(module.children())) > 0:
-            # 递归处理子模块
             replace_linear_with_metis(
                 model=module, 
                 dtype=dtype, 
@@ -115,13 +110,11 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
                 compute_dtype=compute_dtype
             )
         
-        # 检查是否是目标层
         if name in target_modules and isinstance(module, torch.nn.Linear):
             in_features = module.in_features
             out_features = module.out_features
             has_bias = module.bias is not None
             
-            # 创建 BitLinear 替换
             new_layer = BitLinear(
                 in_features=in_features,
                 out_features=out_features,
@@ -131,28 +124,34 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
                 compute_dtype=compute_dtype
             )
             
-            # 🔥 使用 DeepSpeed 上下文管理器访问参数
-            with deepspeed.zero.GatheredParameters([module.weight], modifier_rank=0):
-                # 复制原始权重
+            # 🔥 检查参数是否为空（Zero-3 的特征）
+            if module.weight.numel() == 0:
+                # 只在需要时导入 deepspeed
+                import deepspeed
+                with deepspeed.zero.GatheredParameters([module.weight], modifier_rank=0):
+                    with torch.no_grad():
+                        new_layer.warmup_linear.weight.copy_(module.weight)
+                        if has_bias:
+                            with deepspeed.zero.GatheredParameters([module.bias], modifier_rank=0):
+                                new_layer.warmup_linear.bias.copy_(module.bias)
+            else:
                 with torch.no_grad():
                     new_layer.warmup_linear.weight.copy_(module.weight)
-                    
                     if has_bias:
-                        with deepspeed.zero.GatheredParameters([module.bias], modifier_rank=0):
-                            new_layer.warmup_linear.bias.copy_(module.bias)
+                        new_layer.warmup_linear.bias.copy_(module.bias)
             
             new_layer.split()
-            # 替换模块
             setattr(model, name, new_layer)
     
     return model
 
 
 
-def replace_model_with_metis(model):
+def replace_model_with_metis(model, metis_args = None):
     """替换指定层为 Metis 实现"""
     
-    metis_args = MetisArgs()
+    if metis_args is None:
+        metis_args = MetisArgs()
     dtype = torch.float32
     compute_dtype = torch.float32
     # 替换目标层

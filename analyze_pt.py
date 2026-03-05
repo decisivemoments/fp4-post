@@ -35,10 +35,10 @@ def analyze_pt_file(file_path):
         # compute_V_cos_sim_with_momentum_aligned(state_dict, beta=0.1)
         # compute_V_cos_sim_with_momentum_aligned(state_dict, beta=0)
         # compute_V_cos_sim_with_last_V(state_dict)
-        k = 16  # 可以修改这个值
-        beta = 0.9  # 动量系数
-        analyze_and_plot_matrices(state_dict, k, beta)
-        # analyze_list(state_dict)
+        # k = 16  # 可以修改这个值
+        # beta = 0.9  # 动量系数
+        # analyze_and_plot_matrices(state_dict, k, beta)
+        analyze_list(state_dict)
     else:
         print(f"未知的数据类型: {type(state_dict)}")
         print(f"数据内容: {state_dict}")

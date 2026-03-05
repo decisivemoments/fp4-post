@@ -422,7 +422,9 @@ class LinearLowbitFunction(torch.autograd.Function):
             output = proj_main_dq + residual_dq
         
         # ========== Step 2: 如果需要梯度，执行 SVD 并更新 momentum_v ==========
-        if input_.requires_grad and module_ref.training:
+        # if input_.requires_grad and module_ref.training:
+        if module_ref.training: 
+            print("Updating momentum_v via SVD...")
             # SVD 分解（使用 fp32 提高数值稳定性）
             input_fp32 = cinput.to(torch.float32)
             with torch.amp.autocast(input_fp32.device.type, enabled=False):
