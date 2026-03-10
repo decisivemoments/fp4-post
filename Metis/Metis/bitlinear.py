@@ -49,113 +49,8 @@ class LinearLowbitFunction(torch.autograd.Function):
     tp_parts = 4
     
     compute_dtype = torch.float32
+    metis_mode = "mean"  # 可选 "svd" 或 "mean"
     
-    # # ------------------------------------------------------------------
-    # # Spectral Decomposition for a matrix
-    # # ------------------------------------------------------------------
-    # @staticmethod
-    # def svd_quant(
-    #     input_:torch.Tensor, 
-    #     quant_func, 
-    #     rank=60, 
-    #     niter=0, 
-    #     broadcast_dim=-1,
-    #     tp_simulate: bool = False,      # 新增：是否开启“竖切 TP 模拟”
-    #     tp_parts: int = 4,              # 新增：把 hidden 维等分为多少份（默认四等分，即取 1/4）
-    # ):
-    #     """Decompose input by low-rank + residual, then recompose.
-    #     Steps:
-    #     1) (Optional) pick a representative slice if broadcast_dim >= 0 to reduce
-    #     SVD cost while sharing factors across the broadcast dimension.
-    #     2) If input is 3D [B, T, D], flatten to 2D [B*T, D] for SVD on the last dim.
-    #     3) Compute randomized/low-rank SVD with (q=rank, niter=power iters).        
-    #     4) Form low-rank kernel U S V^T and compute residual R = input - USV^T.
-    #     6) Quantize/dequantize residual with quant_func.
-    #     7) Quantize/dequantize U and V factors as well (S kept in higher precision).
-    #     8) Reconstruct: (quant(U) S quant(V)^T) + residual * residual_scale.
-    #     9) Reshape back if originally 3D.
-    #     """
-                
-    #     did_select_broadcast_dim = False  # 记录是否走了 B 分支（用于后续 unsqueeze）
-    #     if tp_simulate:
-    #         cinput = input_
-    #         D = cinput.shape[-1]
-    #         parts = max(1, int(tp_parts))
-    #         part_idx = int(torch.randint(low=0, high=parts, size=(1,)).item())
-    #         c0 = (D * part_idx) // parts
-    #         c1 = (D * (part_idx + 1)) // parts
-    #         if c1 <= c0:  # 兜底
-    #             c0, c1 = 0, D
-    #         cinput = cinput[..., c0:c1]  # 竖切子块
-    #     elif broadcast_dim >= 0:
-    #         cinput = input_.select(broadcast_dim, 0)
-    #         did_select_broadcast_dim = True
-    #     else:
-    #         cinput = input_
-        
-    #     original_shape = cinput.shape
-    #     if len(original_shape) == 3:
-    #         cinput = cinput.reshape(-1, original_shape[-1])
-    #         input_ = input_.reshape(-1, original_shape[-1])
-        
-        
-    #     ug, sg, vg = torch.svd_lowrank(
-    #         cinput, 
-    #         q=rank, 
-    #         niter=niter
-    #     )
-        
-    #     vg = vg.T
-    #     ug = ug.T                
-
-    #     # ker = (ug.T @ torch.diag(sg) @ vg)
-    #     # if broadcast_dim >= 0:
-    #     #     ker = ker.unsqueeze(broadcast_dim)
-
-    #     # input_res = input_ - ker
-    #     # input_res_scalar = quant_func.get_scalar(input_res)
-    #     # input_res = quant_func.quant(input_res, input_res_scalar)
-    #     # input_res = quant_func.rquant(input_res, input_res_scalar)
-
-    #     ug_scalar = quant_func.get_scalar(ug)
-    #     vg_scalar = quant_func.get_scalar(vg)
-    #     ug = quant_func.quant(ug, ug_scalar)
-    #     ug = quant_func.rquant(ug, ug_scalar)
-        
-    #     vg = quant_func.quant(vg, vg_scalar)
-    #     vg = quant_func.rquant(vg, vg_scalar)
-        
-    #     ker = (ug.T @ torch.diag(sg) @ vg)
-        
-    #     # --- 广播/还原：三分支衔接 ---
-    #     if tp_simulate:
-    #         # TP 分支：把 ker(…, D_sub) 沿 hidden 维重复到全宽 D_full
-    #         D_full = input_.shape[-1]  # 展平后的 hidden 宽度
-    #         D_sub  = ker.shape[-1]
-    #         rep = (D_full + D_sub - 1) // D_sub
-    #         ker = ker.repeat(1, rep)[..., :D_full]
-    #         # 注意：TP 分支不做 broadcast_dim 的 unsqueeze
-    #     elif did_select_broadcast_dim:
-    #         # 仅当对 batch/seq 维做过 select 时才需要 unsqueeze 回来
-    #         ker = ker.unsqueeze(broadcast_dim)
-
-    #     input_res = input_ - ker
-    #     input_res_scalar = quant_func.get_scalar(input_res)
-    #     input_res = quant_func.quant(input_res, input_res_scalar)
-    #     input_res = quant_func.rquant(input_res, input_res_scalar)
-        
-    #     # input_ = ug.T @ torch.diag(sg) @ vg
-    #     # if broadcast_dim >= 0:
-    #     #     input_ = input_.unsqueeze(broadcast_dim)
-
-    #     # input_ = input_ + input_res
-    #     input_ = ker + input_res
-        
-    #     if len(original_shape) == 3:
-    #         input_ = input_.view(original_shape[0], original_shape[1], -1)
-    #     return input_
-        
-
     @staticmethod
     def svd_quant(
         input_: torch.Tensor,
@@ -165,6 +60,9 @@ class LinearLowbitFunction(torch.autograd.Function):
         broadcast_dim: int = -1,
         tp_simulate: bool = False,   # 是否开启“竖切 TP 模拟”
         tp_parts: int = 4,           # 把 hidden 维等分为多少份
+        metis_mode="mean",
+        mean_cache: dict = None, 
+        cache_key: str = "default"
     ):
         """Decompose input by low-rank + residual, then recompose.
         Steps:
@@ -253,6 +151,36 @@ class LinearLowbitFunction(torch.autograd.Function):
 
             return out
 
+        def _mean_quant_single(input_: torch.Tensor) -> torch.Tensor:
+            original_shape = input_.shape
+            if len(original_shape) == 3:
+                input_flat = input_.reshape(-1, original_shape[-1])
+            seq_len = original_shape[1] if len(original_shape) == 3 else original_shape[0]
+            if seq_len == 1 and mean_cache is not None and cache_key in mean_cache:
+                # Decode：加权滚动更新
+                # print(f"Using cached mean for {cache_key} with seq_len={seq_len}")
+                cached_mean, cached_count = mean_cache[cache_key]
+                new_count = cached_count + input_flat.shape[0]
+                this_mean = input_flat.mean(dim=0, keepdim=True)
+                me = (cached_mean * cached_count + this_mean * input_flat.shape[0]) / new_count
+                mean_cache[cache_key] = (me.detach(), new_count)
+            else:
+                # Prefill 或首次
+                # print(f"Calculating mean for {cache_key} with seq_len={seq_len}")
+                me = input_flat.mean(dim=0, keepdim=True)
+                if mean_cache is not None:
+                    mean_cache[cache_key] = (me.detach(), input_flat.shape[0])
+
+            input_res = input_flat - me
+            input_res_scalar = quant_func.get_scalar(input_res)
+            input_res = quant_func.quant(input_res, input_res_scalar)
+            input_res = quant_func.rquant(input_res, input_res_scalar)
+            input_ = me + input_res
+
+            if len(original_shape) == 3:
+                input_ = input_.view(original_shape[0], original_shape[1], -1)
+            return input_
+
         # =========================
         # 竖切 TP 模拟逻辑
         # =========================
@@ -278,7 +206,12 @@ class LinearLowbitFunction(torch.autograd.Function):
         # =========================
         # 原始（非 TP）逻辑
         # =========================
-        return _svd_quant_single(input_)
+        if metis_mode == "svd":
+            return _svd_quant_single(input_)
+        elif metis_mode == "mean":
+            return _mean_quant_single(input_)
+        else:
+            raise ValueError(f"Unsupported metis_mode: {metis_mode}")
 
     
     @staticmethod
@@ -303,6 +236,9 @@ class LinearLowbitFunction(torch.autograd.Function):
                 broadcast_dim=LinearLowbitFunction.activation_broadcast_dim,
                 tp_simulate=LinearLowbitFunction.tp_simulate,
                 tp_parts=LinearLowbitFunction.tp_parts,
+                metis_mode=LinearLowbitFunction.metis_mode,
+                mean_cache=LinearLowbitFunction.mean_cache,        
+                cache_key=LinearLowbitFunction.mean_cache_key,     
             )
             input_scalar = LinearLowbitFunction.q_forward_input.get_scalar(input_)
         else:
@@ -374,6 +310,7 @@ class LinearLowbitFunction(torch.autograd.Function):
                     broadcast_dim=LinearLowbitFunction.backward_broadcast_dim,
                     tp_simulate=LinearLowbitFunction.tp_simulate,
                     tp_parts=LinearLowbitFunction.tp_parts,
+                    metis_mode=LinearLowbitFunction.metis_mode
                 )
                 grad_output = grad_output.reshape(-1, grad_output.shape[-1]).T
 
@@ -513,9 +450,7 @@ class BitLinear(nn.Module):
         LinearLowbitFunction.tp_simulation = args.tp_simulation
         LinearLowbitFunction.tp_parts = args.tp_parts
         LinearLowbitFunction.compute_dtype = self.compute_dtype
-        
-        
-
+        LinearLowbitFunction.metis_mode = args.metis_mode
 
         self.args = args
         self.is_svd_quant = False
@@ -524,13 +459,19 @@ class BitLinear(nn.Module):
         if args.forward_svd_warmup_steps <= 0 and args.enable_forward_svd:
             print("split")
             self.split()
+        
+        self.mean_cache = {}
+        self.layer_name = ""  # 由 convert_to_metis 赋值
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        LinearLowbitFunction.mean_cache = self.mean_cache
         if self.is_svd_quant:
+            LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.vlinear"
             y = self.vlinear(x)
             y = torch.mul(self.s, y)
             y = self.ulinear(y)
             if self.args.forward_svd_rank > 0:
+                LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.warmup"
                 y = y + self.warmup_linear(x)
             
             
@@ -640,24 +581,23 @@ class BitLinear(nn.Module):
                     compute_dtype=self.compute_dtype
                     # device=device
                 )
-                self.ulinear = LinearLowbit(
+                self.ulinear = nn.Linear(
                     self.args.forward_svd_rank, # u.shape[1] // 30, 
                     u.shape[0], 
                     bias=False,
-                    args=self.args,
-                    storage_dtype=original_dtype,
-                    compute_dtype=self.compute_dtype
                     # device=device
                 )
                 self.vlinear.weight.copy_(v[: self.args.forward_svd_rank, :])
                 self.ulinear.weight.copy_(u[:, : self.args.forward_svd_rank])
             else:
-                self.vlinear = nn.Linear(
+                self.vlinear = LinearLowbit(
                     v.shape[1], 
                     v.shape[0], # v.shape[0] // 30, 
                     bias=False, 
-                    # args=self.args,
-                    device=device
+                    args=self.args,                    
+                    storage_dtype=original_dtype,
+                    compute_dtype=self.compute_dtype
+                    # device=device
                 )
                 self.ulinear = nn.Linear(
                     u.shape[1], # u.shape[1] // 30, 

@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 import torch
 from accelerate import logging
 from datasets import load_dataset
-
+from transformers import AutoModelForCausalLM, GenerationConfig
 from trl import (
     DatasetMixtureConfig,
     GRPOConfig,
@@ -49,14 +49,214 @@ import json
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+sys.path.append("..") 
+from Metis.Metis import BitLinear
+from metis_monitor import MetisDiagnosticCallback, RolloutRewardWrapper, DiagnosticsAnalyzer
+from rollout_quality import QualityConfig, QualityAnalyzer
+
+class MetisArgs:
+    """Metis 配置参数"""
+    def __init__(self):
+        self.device = "cuda"
+        self.enable_forward_svd = True
+        self.enable_lowbit = True
+        self.enable_te = False
+        
+        self.q_forward_input = "nvfp4e2m1bnosr"  
+        self.q_forward_weight = "nvfp4e2m1bnosr"
+        self.q_backward_input = "nvfp4e2m1b"
+        self.q_backward_weight = "nvfp4e2m1b"
+        self.q_backward_outputgrad = "nvfp4e2m1b"
+        
+        self.enable_backward_svd = True
+        self.backward_lowrank_svd = 64
+        self.backward_lowrank_niter = 2
+        
+        self.enable_activation_svd = True
+        self.activation_lowrank_svd = 64
+        self.activation_lowrank_niter = 0
+        
+        self.activation_broadcast_dim = 0
+        self.backward_broadcast_dim = -1
+        
+        self.enable_nv_recipe = False
+        
+        self.gradacc_broadcast = False
+        self.gradacc_broadcast_steps = 1
+        
+        self.forward_svd_warmup_steps = 50 #we will split manually after replace nn.linear with bitlinear
+        self.forward_svd_rank = 64
+        self.tp_simulation = False
+        self.tp_parts = 4
+
+        self.metis_mode = "mean"  # 可选 "svd" 或 "mean"
+
+def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, compute_dtype=None):
+    """
+    递归替换模型中的 nn.Linear 为 BitLinear
+    """
+    if target_modules is None:
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        
+    if compute_dtype is None:
+        compute_dtype = torch.float32
+    
+    for name, module in list(model.named_modules()):  # ← list化防止替换时迭代器失效
+        if name.split('.')[-1] not in target_modules:
+            continue
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        
+        # 获取父模块和子模块名
+        if '.' in name:
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            parent = model.get_submodule(parent_name)
+        else:
+            parent = model
+            child_name = name
+
+        in_features = module.in_features
+        out_features = module.out_features
+        has_bias = module.bias is not None
+        
+        new_layer = BitLinear(
+            in_features=in_features,
+            out_features=out_features,
+            args=metis_args,
+            bias=has_bias,
+            dtype=dtype,
+            compute_dtype=compute_dtype
+        )
+        
+        # 🔥 检查参数是否为空（Zero-3 的特征）
+        if module.weight.numel() == 0:
+            import deepspeed
+            with deepspeed.zero.GatheredParameters([module.weight], modifier_rank=0):
+                with torch.no_grad():
+                    new_layer.warmup_linear.weight.copy_(module.weight)
+                    if has_bias:
+                        with deepspeed.zero.GatheredParameters([module.bias], modifier_rank=0):
+                            new_layer.warmup_linear.bias.copy_(module.bias)
+        else:
+            with torch.no_grad():
+                new_layer.warmup_linear.weight.copy_(module.weight)
+                if has_bias:
+                    new_layer.warmup_linear.bias.copy_(module.bias)
+        
+        new_layer.layer_name = name  # ← 赋全名，供 mean_cache key 使用
+        new_layer.split()
+        setattr(parent, child_name, new_layer)
+    
+    return model
+
+
+def replace_model_with_metis(model, metis_args = None):
+    """替换指定层为 Metis 实现"""
+    
+    if metis_args is None:
+        metis_args = MetisArgs()
+    dtype = torch.bfloat16
+    compute_dtype = torch.bfloat16
+    # 替换目标层
+    model = replace_linear_with_metis(
+        model = model,
+        dtype = dtype,
+        metis_args = metis_args,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        compute_dtype=compute_dtype
+    )
+    
+    return model
+
 logger = logging.get_logger(__name__)
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
+
+from latex2sympy2_extended import NormalizationConfig
+from math_verify import LatexExtractionConfig, parse, verify
+
+
+def custom_accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[float | None]:
+    r"""
+    Reward function that checks if the completion matches the ground truth.
+        - If both gold and prediction are parseable → use math verification.
+        - If gold is not parseable → try simple answer matching (True/False/Yes/No).
+        - If simple matching also fails → return `None` to skip the example.
+
+    Args:
+        completions (`list[list[dict[str, str]]]`):
+            List of completions to be evaluated. Each completion must be a list of one message, i.e. a dictionary
+            containing the key `"content"` with the value being the text of the completion.
+        solution: (`list[str]`):
+            List of the raw-text solutions to the questions/problems/prompts.
+        **kwargs:
+            Additional keyword arguments. This function does not use them, but they are required in the function
+            signature to ensure compatibility with trainers like [`GRPOTrainer`].
+    """
+
+    contents = [completion[0]["content"] for completion in completions]
+    rewards = []
+
+    for content, sol in zip(contents, solution, strict=True):
+        try:
+            # ── 防御：content / sol 为空或非字符串时直接跳过 ──────────────────
+            if not isinstance(content, str) or not isinstance(sol, str):
+                rewards.append(0.0)
+                continue
+
+            content_stripped = content.strip()
+            sol_stripped = sol.strip()
+
+            # ── 首先尝试解析为数学表达式 ──────────────────────────────────────
+            gold_parsed = parse(sol_stripped)
+
+            if len(gold_parsed) != 0:
+                # 数学表达式场景
+                answer_parsed = parse(
+                    content_stripped,
+                    extraction_config=[
+                        LatexExtractionConfig(
+                            normalization_config=NormalizationConfig(units=True),
+                            boxed_match_priority=0,
+                            try_extract_without_anchor=False,
+                        )
+                    ],
+                    extraction_mode="first_match",
+                )
+                reward = float(verify(gold_parsed, answer_parsed))
+
+            else:
+                # ── 非数学表达式场景：在句子末尾找独立词 ──────────────────────
+                words = content_stripped.split()
+
+                # 核心修复：空内容时无法提取答案，直接给 0 分（而非崩溃）
+                if not words:
+                    reward = 0.0
+                else:
+                    last_word = words[-1].rstrip('.,!?;:').lower()
+
+                    if sol_stripped in ("True", "False", "Yes", "No"):
+                        reward = 1.0 if last_word == sol_stripped.lower() else 0.0
+                    else:
+                        # 既不是数学表达式，也不是简单答案
+                        reward = 0.0
+
+        except Exception as e:
+            # ── 兜底：任何未预期异常都记录并跳过，不中断训练 ─────────────────
+            print(f"[custom_accuracy_reward] Unexpected error — skipping sample. "
+                  f"sol={sol!r}, content_preview={content[:80]!r}, error={e}")
+            reward = 0.0
+
+        rewards.append(reward)
+
+    return rewards
+
 reward_funcs_registry = {
-    "accuracy_reward": accuracy_reward,
+    "accuracy_reward": custom_accuracy_reward,
     "reasoning_accuracy_reward": reasoning_accuracy_reward,
     "think_format_reward": think_format_reward,
     "get_soft_overlong_punishment": get_soft_overlong_punishment(max_completion_len=1280, soft_punish_cache=256),
@@ -131,173 +331,8 @@ class ActivationCapture:
         
     def capture_hook(self, name):
         def hook(module, input, output):
-            # 获取input tensor
-            if isinstance(input, tuple):
-                input_tensor = input[0]
-            else:
-                input_tensor = input
-                
-            if not isinstance(input_tensor, torch.Tensor):
-                return
-            
-            # 只处理requires_grad=True的情况
-            if not input_tensor.requires_grad:
-                return
-            
-            # (bs, seq, hs) -> (bs*seq, hs)
-            bs, seq, hs = input_tensor.shape
-            act_flat = input_tensor.detach().reshape(-1, hs).cpu().float()
-            
-            # 任务1: 存储原始X矩阵，只存储batch中的第一个
-            first_batch_X = input_tensor[0].detach().cpu().float()  # 取第一个batch的序列 (seq, hs)
-            self.original_Xs[name].append({
-                'step': self.current_step,
-                'X': first_batch_X.clone()
-            })
-            
-            # SVD分解，取前64个
-            U, S, Vt = torch.linalg.svd(act_flat, full_matrices=False)
-            U_64 = U[:, :64]  # (bs*seq, 64)
-            S_64 = S[:64]      # (64,)
-            V_64 = Vt[:64, :].T  # (hs, 64)
-            
-            # 任务2: 每步保存完整SVD
-            self.svd_snapshots[name].append({
-                'step': self.current_step,
-                'U': U_64.clone(),
-                'S': S_64.clone(),
-                'V': V_64.clone()
-            })
-            
-            # 任务3: 每步都进行矩阵分析和绘图
-            self.analyze_and_plot_matrices(name, act_flat, U_64, S_64, V_64, self.current_step)
-            
-            # 每10步保存一次
-            if self.current_step % 10 == 0:
-                self.save_results()
-            
-            self.now_monitor_layer += 1
-            if self.now_monitor_layer == self.monitor_layer_len:
-                self.increment_step()
-                self.now_monitor_layer = 0
-                
+            pass
         return hook
-    
-    def analyze_and_plot_matrices(self, name, original_X, U_k, S_k, V_k, step_idx):
-        """
-        分析并绘制三个矩阵的数据绝对值分布直方图
-        """
-        # 设置参数
-        k = 16  # 可以修改这个值
-        beta = 0.9  # 动量系数
-        
-        # 获取或初始化动量V
-        momentum_key = f"{name}_momentum_v"
-        if not hasattr(self, momentum_key):
-            setattr(self, momentum_key, V_k[:, :k].clone())
-            #说明是第0步，那么也不用执行后面的了
-            return
-        
-        momentum_v = getattr(self, momentum_key)
-        
-        # 重构前k个奇异向量对应的矩阵 X_k = U_k @ diag(S_k) @ V_k^T
-        S_k_diag = torch.diag(S_k[:k])
-        U_k_reduced = U_k[:, :k]
-        V_k_reduced = V_k[:, :k]
-        reduced_X = U_k_reduced @ S_k_diag @ V_k_reduced.T
-
-        # 计算投影矩阵 X_proj = X @ V_momentum @ V_momentum^T
-        projected_X = original_X @ momentum_v @ momentum_v.T
-        
-        # 更新动量V
-        current_v_k = V_k[:, :k]
-        # 符号对齐
-        dot_products = (momentum_v * current_v_k).sum(dim=0)
-        sign_correction = torch.sign(dot_products)
-        current_v_aligned = current_v_k * sign_correction
-        momentum_v = momentum_v * beta + current_v_aligned * (1 - beta)
-        momentum_v = torch.nn.functional.normalize(momentum_v, dim=0)
-        setattr(self, momentum_key, momentum_v)
-        
-        # 绘制三个矩阵的绝对值分布直方图
-        self.plot_matrix_abs_distribution(original_X, reduced_X, projected_X, name, step_idx, k)
-    
-    def plot_matrix_abs_distribution(self, original_X, reduced_X, projected_X, name, step_idx, k):
-        """
-        绘制三个矩阵的数据绝对值分布直方图
-        """
-        fig, ax = plt.subplots(figsize=(12, 8))
-        
-        # 获取绝对值
-        orig_abs = original_X.abs().flatten().numpy()
-        reduced_abs = reduced_X.abs().flatten().numpy()
-        proj_abs = projected_X.abs().flatten().numpy()
-        
-        # 过滤掉零值以避免log scale问题
-        orig_abs = orig_abs[orig_abs > 0]
-        reduced_abs = reduced_abs[reduced_abs > 0]
-        proj_abs = proj_abs[proj_abs > 0]
-        
-        # 绘制直方图 - 第一个矩阵用填充，第二、三个只画线
-        counts_orig, bins_orig, _ = ax.hist(orig_abs, bins=100, alpha=0.6, label='Original Matrix |X|', log=True, density=True)
-        ax.hist(reduced_abs, bins=bins_orig, alpha=1.0, label=f'Reduced Matrix |X_k| (k={k})', log=True, density=True, 
-                histtype='step', linewidth=2)
-        ax.hist(proj_abs, bins=bins_orig, alpha=1.0, label=f'Projected Matrix |X*V*V^T|', log=True, density=True, 
-                histtype='step', linewidth=2)
-        
-        ax.set_xlabel('Absolute Value (Log Scale)')
-        ax.set_ylabel('Density (Log Scale)')
-        ax.set_title(f'Distribution of Absolute Values - Layer: {name}, Step: {step_idx}, Rank: {self.rank}')
-        ax.set_xscale('log')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # 保存图片
-        os.makedirs(os.path.join(self.save_dir, "pics"), exist_ok=True)
-        safe_name = name.replace('.', '_')
-        filename = os.path.join(self.save_dir, "pics", f"matrix_distribution_{safe_name}_step_{step_idx}_rank{self.rank}.png")
-        plt.savefig(filename, dpi=150, bbox_inches='tight')
-        print(f"已保存图片: {filename}")
-        plt.close()
-    
-    def save_results(self):
-        """保存结果到文件"""
-        # 保存SVD快照
-        for layer_name, snapshots in self.svd_snapshots.items():
-            if snapshots:
-                safe_name = layer_name.replace('.', '_')
-                save_path = os.path.join(self.save_dir, f"{safe_name}_snapshots_rank{self.rank}.pt")
-                
-                # 追加模式：先读取已有数据，再合并保存
-                if os.path.exists(save_path):
-                    existing_data = torch.load(save_path)
-                    existing_data.extend(snapshots)
-                    torch.save(existing_data, save_path)
-                else:
-                    torch.save(snapshots, save_path)
-        
-        # 保存原始X矩阵
-        for layer_name, X_data in self.original_Xs.items():
-            if X_data:
-                safe_name = layer_name.replace('.', '_')
-                save_path = os.path.join(self.save_dir, f"{safe_name}_original_Xs_rank{self.rank}.pt")
-                
-                # 追加模式：先读取已有数据，再合并保存
-                if os.path.exists(save_path):
-                    existing_data = torch.load(save_path)
-                    existing_data.extend(X_data)
-                    torch.save(existing_data, save_path)
-                else:
-                    torch.save(X_data, save_path)
-        
-        print(f"💾 Rank {self.rank} saved results at step {self.current_step}")
-        
-        # 清理已保存的数据
-        self.svd_snapshots.clear()
-        self.original_Xs.clear()
-
     
     def increment_step(self):
         """训练步骤计数"""
@@ -348,6 +383,25 @@ def main(script_args, training_args, model_args, dataset_args):
                     f"Could not load reward function '{func_name}'. Expected one of "
                     f"{list(reward_funcs_registry.keys())} or a valid import path."
                 )
+    rollout_wrappers = []
+    if len(reward_funcs) > 0 and callable(reward_funcs[0]):
+        rollout_log_path = os.path.join(training_args.output_dir, "rollout.jsonl")
+        quality_cfg = QualityConfig(
+            min_char_len=8,
+            repeat_2gram_ratio_thresh=0.30,
+            mixed_lang_switch_thresh=4,
+            enable_repetition=False,
+            # 如果任务是纯中文推理，关闭 mixed_lang 检测
+            # enable_mixed_lang=False,
+        )
+
+        wrapper = RolloutRewardWrapper(
+            reward_funcs[0],
+            log_path=rollout_log_path,
+            quality_cfg=quality_cfg,
+        )
+        reward_funcs[0] = wrapper
+        rollout_wrappers.append(wrapper)
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
 
     model_kwargs = dict(
@@ -380,9 +434,13 @@ def main(script_args, training_args, model_args, dataset_args):
     else:
         raise ValueError("Either `datasets` or `dataset_name` must be provided.")
 
+    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs)
+    if script_args.use_metis:
+        print("use metis, we will replace layer with metis")
+        model = replace_model_with_metis(model)
     # Initialize the GRPO trainer
     trainer = GRPOTrainer(
-        model=model_args.model_name_or_path,
+        model=model,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
@@ -390,7 +448,16 @@ def main(script_args, training_args, model_args, dataset_args):
         peft_config=get_peft_config(model_args),
     )
 
-    if script_args.use_cumstom_analysis:
+    diagnostic_cb = MetisDiagnosticCallback(
+        model=trainer.model,
+        output_dir=training_args.output_dir,
+        log_every_steps=4,           # 每 4 步记录一次轻量统计
+        rank_check_every_steps=10,    # 每 10 步计算一次有效秩
+        saturation_alert_threshold=0.05,
+        rollout_wrappers=rollout_wrappers,
+    )
+    trainer.add_callback(diagnostic_cb)
+    if script_args.use_custom_analysis:
         # 获取当前进程的rank
         rank = trainer.accelerator.process_index
         # 初始化时传入rank
@@ -402,6 +469,13 @@ def main(script_args, training_args, model_args, dataset_args):
 
     # Log training complete
     trainer.accelerator.print("✅ Training completed.")
+
+    if trainer.accelerator.is_main_process:
+        # analyzer = DiagnosticsAnalyzer(training_args.output_dir)
+        # analyzer.print_summary()
+        # analyzer.plot_all()
+        analyzer = QualityAnalyzer(output_dir / "rollout_quality")
+        analyzer.plot_all()
 
     # Save and push to Hub
     trainer.save_model(training_args.output_dir)
@@ -450,7 +524,27 @@ if __name__ == "__main__":
         return_remaining_strings=True
     )
     output_dir = getattr(training_args, 'output_dir', 'Qwen2_5-0.5B-DPO')
+    training_args.set_save(strategy="steps", steps=50)
     
+    # 自动从模型目录读取 generation_config 并同步到 training_args
+    # gen_config_path = os.path.join(model_args.model_name_or_path, "generation_config.json")
+    # if os.path.exists(gen_config_path):
+    #     gen_config = GenerationConfig.from_pretrained(model_args.model_name_or_path)
+        
+    #     # 只在用户没有显式覆盖时才同步（检查是否还是 dataclass 默认值）
+    #     if training_args.temperature == 1.0 and hasattr(gen_config, "temperature"):
+    #         training_args.temperature = gen_config.temperature
+    #     if training_args.top_p == 1.0 and hasattr(gen_config, "top_p"):
+    #         training_args.top_p = gen_config.top_p
+    #     if training_args.top_k == 0 and hasattr(gen_config, "top_k"):
+    #         training_args.top_k = gen_config.top_k
+    #     if hasattr(gen_config, "repetition_penalty"):
+    #         training_args.repetition_penalty = gen_config.repetition_penalty
+        
+    #     print(f"✅ Synced generation config from model: "
+    #         f"temp={training_args.temperature}, "
+    #         f"top_p={training_args.top_p}, "
+    #         f"top_k={training_args.top_k}")
     if script_args.print_args:
         print_and_save_args(script_args, "Script Arguments", output_dir)
         print_and_save_args(training_args, "Training Arguments", output_dir)

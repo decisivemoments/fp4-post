@@ -6,3 +6,4 @@ training_output.log
 **/__pycache__
 **/activation_analysis
 pic/
+grpo/Qwen2_5-0.5B-grpo*
