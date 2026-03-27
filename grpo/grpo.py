@@ -48,10 +48,11 @@ from trl.rewards import accuracy_reward, get_soft_overlong_punishment, reasoning
 import json
 from pathlib import Path
 import matplotlib.pyplot as plt
+import pickle
 
 sys.path.append("..") 
 from Metis.Metis import BitLinear
-from metis_monitor import MetisDiagnosticCallback, RolloutRewardWrapper, DiagnosticsAnalyzer
+from metis_monitor import MetisDiagnosticCallback, RolloutRewardWrapper, DiagnosticsAnalyzer, RolloutLogitsCapture
 from rollout_quality import QualityConfig, QualityAnalyzer
 
 class MetisArgs:
@@ -301,6 +302,11 @@ class GRPOScriptArguments(ScriptArguments):
         default=False, # 默认值
         metadata={"help": "Whether to enable custom activation analysis using ActivationCapture."} # 帮助信息
     )
+    
+    analyze_rollout: bool = field(
+        default=False,
+        metadata={"help": "whether analyze rollout text quality, token entropy, probability, token, mismatch"}
+    )
 
     use_metis: bool = field(
         default=False,
@@ -318,46 +324,152 @@ class ActivationCapture:
         self.save_dir = save_dir
         self.rank = rank
         os.makedirs(save_dir, exist_ok=True)
-        
-        # 存储每1步的完整SVD
-        self.svd_snapshots = defaultdict(list)
-        # 存储原始X矩阵
-        self.original_Xs = defaultdict(list)
-        
+
         self.hooks = []
-        self.current_step = 0
-        self.now_monitor_layer = 0
-        self.monitor_layer_len = 0
-        
+        self.current_prefill_len = 0
+
+        # layer_name -> 打开的文件句柄（二进制追加模式）
+        self.layer_files = {}    # name -> file path
+        self.layer_fds   = {}    # name -> file descriptor (open handle)
+
+    # ------------------------------------------------------------------ #
+    def _append_record(self, name, record: dict):
+        """直接向已打开的文件句柄追加一条 pickle record，O(1) I/O"""
+        fd = self.layer_fds[name]
+        pickle.dump(record, fd)
+        fd.flush()               # 确保每步都落盘，防止崩溃丢数据
+
+    # ------------------------------------------------------------------ #
+    # def capture_hook(self, name):
+    #     def hook(module, input, output):
+    #         if not (input and isinstance(input[0], torch.Tensor)):
+    #             return
+
+    #         x: torch.Tensor = input[0]
+    #         seq_len = x.shape[1]
+
+    #         # ① Prefill：seq_len > 1 且无梯度
+    #         if seq_len > 1 and not x.requires_grad:
+    #             self.current_prefill_len = seq_len
+
+    #         # ② 训练阶段：有梯度
+    #         elif x.requires_grad and module.training:
+    #             record = {
+    #                 'activation':  x.detach().cpu(),
+    #                 'shape':       tuple(x.shape),
+    #                 'seq_len':     seq_len,
+    #                 'prefill_len': self.current_prefill_len,
+    #                 'dtype':       str(x.dtype),
+    #             }
+    #             self._append_record(name, record)
+
+    #     return hook
+    
     def capture_hook(self, name):
         def hook(module, input, output):
-            pass
+            if not (input and isinstance(input[0], torch.Tensor)):
+                return
+
+            x: torch.Tensor = input[0]
+            seq_len = x.shape[1]
+
+            # ① Prefill：seq_len > 1 且无梯度
+            if seq_len > 1 and not x.requires_grad:
+                self.current_prefill_len = seq_len
+
+            # ② 训练阶段：有梯度
+            elif x.requires_grad and module.training:
+                with torch.no_grad():
+                    x_f = x.float()                          # bfloat16 → float32
+                    b, s, h = x_f.shape
+
+                    mean_full = x_f.reshape(-1, h).mean(dim=0).cpu()   # (h,)
+
+                    pl = self.current_prefill_len
+                    if pl > 0 and pl <= s:
+                        mean_prefill = x_f[:, :pl, :].reshape(-1, h).mean(dim=0).cpu()  # (h,)
+                    else:
+                        mean_prefill = mean_full.clone()
+
+                record = {
+                    'mean_full':    mean_full,      # (h,) float32
+                    'mean_prefill': mean_prefill,   # (h,) float32
+                    'shape':        (b, s, h),
+                    'prefill_len':  self.current_prefill_len,
+                }
+                self._append_record(name, record)
+
         return hook
-    
-    def increment_step(self):
-        """训练步骤计数"""
-        self.current_step += 1
-    
+
+
+    # ------------------------------------------------------------------ #
     def register_hooks(self, model, target_layers):
-        self.monitor_layer_len = len(target_layers)
+        if self.rank != 0:
+            return
         for name, module in model.named_modules():
-            if name in target_layers:
-                hook = module.register_forward_hook(self.capture_hook(name))
-                self.hooks.append(hook)
-                print(f"📌 Registered hook: {name}")
-    
+            if name not in target_layers:
+                continue
+
+            safe  = name.replace('.', '_')
+            fpath = os.path.join(self.save_dir, f'layer_{safe}_rank{self.rank}.pkl')
+
+            # 打开文件句柄，保持常开，追加写入
+            fd = open(fpath, 'ab')
+            self.layer_files[name] = fpath
+            self.layer_fds[name]   = fd
+
+            hook = module.register_forward_hook(self.capture_hook(name))
+            self.hooks.append(hook)
+            print(f"📌 Registered hook: {name}  →  {os.path.basename(fpath)}")
+
+    # ------------------------------------------------------------------ #
     def remove_hooks(self):
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
-        # 最后保存一次
-        self.save_results()
+
+        # 关闭所有文件句柄
+        for name, fd in self.layer_fds.items():
+            fd.close()
+            fpath = self.layer_files[name]
+            # 统计条数
+            count = 0
+            with open(fpath, 'rb') as f:
+                while True:
+                    try:
+                        pickle.load(f)
+                        count += 1
+                    except EOFError:
+                        break
+            print(f"📊 {name}: {count} records  →  {fpath}")
+
+        self.layer_fds.clear()
+        print("✅ Done.")
+
 
 # 指定要监控的层
 target_layers = [
     'model.layers.0.self_attn.q_proj',
+    'model.layers.0.self_attn.k_proj',
+    'model.layers.0.self_attn.v_proj',
+    'model.layers.0.self_attn.o_proj',
+    'model.layers.0.mlp.up_proj',
+    'model.layers.0.mlp.gate_proj',
+    'model.layers.0.mlp.down_proj',
     'model.layers.11.self_attn.q_proj',
+    'model.layers.11.self_attn.k_proj',
+    'model.layers.11.self_attn.v_proj',
+    'model.layers.11.self_attn.o_proj',
+    'model.layers.11.mlp.up_proj',
+    'model.layers.11.mlp.gate_proj',
+    'model.layers.11.mlp.down_proj',
     'model.layers.23.self_attn.q_proj',
+    'model.layers.23.self_attn.k_proj',
+    'model.layers.23.self_attn.v_proj',
+    'model.layers.23.self_attn.o_proj',
+    'model.layers.23.mlp.up_proj',
+    'model.layers.23.mlp.gate_proj',
+    'model.layers.23.mlp.down_proj',
 ]
 
 
@@ -383,25 +495,6 @@ def main(script_args, training_args, model_args, dataset_args):
                     f"Could not load reward function '{func_name}'. Expected one of "
                     f"{list(reward_funcs_registry.keys())} or a valid import path."
                 )
-    rollout_wrappers = []
-    if len(reward_funcs) > 0 and callable(reward_funcs[0]):
-        rollout_log_path = os.path.join(training_args.output_dir, "rollout.jsonl")
-        quality_cfg = QualityConfig(
-            min_char_len=8,
-            repeat_2gram_ratio_thresh=0.30,
-            mixed_lang_switch_thresh=4,
-            enable_repetition=False,
-            # 如果任务是纯中文推理，关闭 mixed_lang 检测
-            # enable_mixed_lang=False,
-        )
-
-        wrapper = RolloutRewardWrapper(
-            reward_funcs[0],
-            log_path=rollout_log_path,
-            quality_cfg=quality_cfg,
-        )
-        reward_funcs[0] = wrapper
-        rollout_wrappers.append(wrapper)
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
 
     model_kwargs = dict(
@@ -416,7 +509,7 @@ def main(script_args, training_args, model_args, dataset_args):
         model_kwargs["device_map"] = get_kbit_device_map()
         model_kwargs["quantization_config"] = quantization_config
 
-    training_args.model_init_kwargs = model_kwargs
+    # training_args.model_init_kwargs = model_kwargs
 
     # Load the dataset
     if dataset_args.datasets and script_args.dataset_name:
@@ -438,6 +531,27 @@ def main(script_args, training_args, model_args, dataset_args):
     if script_args.use_metis:
         print("use metis, we will replace layer with metis")
         model = replace_model_with_metis(model)
+
+    rollout_wrappers = []
+    if script_args.analyze_rollout and len(reward_funcs) > 0 and callable(reward_funcs[0]):
+        rollout_log_path = os.path.join(training_args.output_dir, "rollout.jsonl")
+        quality_cfg = QualityConfig(
+            min_char_len=8,
+            repeat_2gram_ratio_thresh=0.30,
+            mixed_lang_switch_thresh=4,
+            enable_repetition=False,
+            # 如果任务是纯中文推理，关闭 mixed_lang 检测
+            # enable_mixed_lang=False,
+        )
+
+        wrapper = RolloutRewardWrapper(
+            reward_funcs[0],
+            log_path=rollout_log_path,
+            quality_cfg=quality_cfg,
+        )
+        wrapper.set_model(model)
+        reward_funcs[0] = wrapper
+        rollout_wrappers.append(wrapper)
     # Initialize the GRPO trainer
     trainer = GRPOTrainer(
         model=model,
@@ -447,25 +561,32 @@ def main(script_args, training_args, model_args, dataset_args):
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
     )
-
-    diagnostic_cb = MetisDiagnosticCallback(
-        model=trainer.model,
-        output_dir=training_args.output_dir,
-        log_every_steps=4,           # 每 4 步记录一次轻量统计
-        rank_check_every_steps=10,    # 每 10 步计算一次有效秩
-        saturation_alert_threshold=0.05,
-        rollout_wrappers=rollout_wrappers,
-    )
-    trainer.add_callback(diagnostic_cb)
+    if script_args.analyze_rollout:
+        capture = RolloutLogitsCapture()
+        capture.attach(model)
+        diagnostic_cb = MetisDiagnosticCallback(
+            model=trainer.model,
+            output_dir=training_args.output_dir,
+            log_every_steps=4,           # 每 4 步记录一次轻量统计
+            rank_check_every_steps=10,    # 每 10 步计算一次有效秩
+            saturation_alert_threshold=0.05,
+            rollout_wrappers=rollout_wrappers,
+            rollout_capture  = capture,
+        )
+        trainer.add_callback(diagnostic_cb)
     if script_args.use_custom_analysis:
         # 获取当前进程的rank
         rank = trainer.accelerator.process_index
         # 初始化时传入rank
-        capture = ActivationCapture(save_dir="activation_analysis", rank=rank)
+        capture = ActivationCapture(save_dir=os.path.join(training_args.output_dir, "activation_analysis"), rank=rank)
         capture.register_hooks(trainer.model, target_layers)
 
     # Train the model
-    trainer.train()
+    if training_args.resume_from_checkpoint is not None and training_args.resume_from_checkpoint.lower() == "true":
+        training_args.resume_from_checkpoint = True
+    elif training_args.resume_from_checkpoint is not None and training_args.resume_from_checkpoint.lower() == "false":
+        training_args.resume_from_checkpoint = False
+    trainer.train(resume_from_checkpoint = training_args.resume_from_checkpoint)
 
     # Log training complete
     trainer.accelerator.print("✅ Training completed.")
@@ -474,7 +595,7 @@ def main(script_args, training_args, model_args, dataset_args):
         # analyzer = DiagnosticsAnalyzer(training_args.output_dir)
         # analyzer.print_summary()
         # analyzer.plot_all()
-        analyzer = QualityAnalyzer(output_dir / "rollout_quality")
+        analyzer = QualityAnalyzer(output_dir + "/rollout_quality")
         analyzer.plot_all()
 
     # Save and push to Hub
@@ -524,27 +645,8 @@ if __name__ == "__main__":
         return_remaining_strings=True
     )
     output_dir = getattr(training_args, 'output_dir', 'Qwen2_5-0.5B-DPO')
-    training_args.set_save(strategy="steps", steps=50)
+    training_args.set_save(strategy="steps", steps=1000)
     
-    # 自动从模型目录读取 generation_config 并同步到 training_args
-    # gen_config_path = os.path.join(model_args.model_name_or_path, "generation_config.json")
-    # if os.path.exists(gen_config_path):
-    #     gen_config = GenerationConfig.from_pretrained(model_args.model_name_or_path)
-        
-    #     # 只在用户没有显式覆盖时才同步（检查是否还是 dataclass 默认值）
-    #     if training_args.temperature == 1.0 and hasattr(gen_config, "temperature"):
-    #         training_args.temperature = gen_config.temperature
-    #     if training_args.top_p == 1.0 and hasattr(gen_config, "top_p"):
-    #         training_args.top_p = gen_config.top_p
-    #     if training_args.top_k == 0 and hasattr(gen_config, "top_k"):
-    #         training_args.top_k = gen_config.top_k
-    #     if hasattr(gen_config, "repetition_penalty"):
-    #         training_args.repetition_penalty = gen_config.repetition_penalty
-        
-    #     print(f"✅ Synced generation config from model: "
-    #         f"temp={training_args.temperature}, "
-    #         f"top_p={training_args.top_p}, "
-    #         f"top_k={training_args.top_k}")
     if script_args.print_args:
         print_and_save_args(script_args, "Script Arguments", output_dir)
         print_and_save_args(training_args, "Training Arguments", output_dir)

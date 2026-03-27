@@ -9,12 +9,13 @@ accelerate launch --config_file multi_gpu.yaml  grpo.py \
     --report_to tensorboard \
     --num_train_epochs 1 \
     --per_device_train_batch_size 8 \
-    --output_dir Qwen2_5-0.5B-grpo-bs-8 \
+    --output_dir Qwen2_5-0.5B-grpo-longcontext-test-keep-runs \
     --reward_funcs accuracy_reward \
     --deepspeed ds_config_zero2.json \
     --bf16 true \
     --use_metis false \
-    --analyze_rollout true \
+    --analyze_rollout false \
     --resume_from_checkpoint true \
-    --use_custom_analysis true
+    --use_custom_analysis true \
+    --max_completion_length 8192
     # --gradient_checkpointing false

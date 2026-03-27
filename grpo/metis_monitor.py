@@ -6,12 +6,17 @@ import os
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
 from transformers import TrainerCallback
 from rollout_quality import (
     QualityConfig, analyze_sample, aggregate_step, QualityLogger, analyze_batch
+)
+from rollout_analysis import (
+    AnalysisConfig, AnalysisLogger, analyze_sample as analyze_sample_logits,
+    aggregate_step as aggregate_analysis_step,
 )
 
 # ─────────────────────────────────────────────
@@ -86,6 +91,57 @@ def safe_json_value(v):
         return v.item() if v.numel() == 1 else v.tolist()
     return str(v)
 
+class RolloutLogitsCapture:
+
+    def __init__(self):
+        self._buffer: Optional[Dict] = None
+        self._original_generate = None
+
+    def attach(self, model):
+        self._original_generate = model.generate
+        capture = self
+
+        def patched_generate(input_ids, **kwargs):
+            # 保存原始的 return_dict_in_generate 设置
+            original_return_dict = kwargs.get("return_dict_in_generate", False)
+
+            # 强制开启，用于捕获 logits
+            kwargs["output_logits"] = True
+            kwargs["return_dict_in_generate"] = True
+            kwargs.pop("output_scores", None)
+
+            output = capture._original_generate(input_ids, **kwargs)
+
+            # 捕获我们需要的数据
+            S_p = input_ids.shape[1]
+            rollout_logits = torch.stack(output.logits, dim=1)  # (B, S_r, V)
+
+            capture._buffer = {
+                "prompt_ids":     input_ids.cpu(),
+                "response_ids":   output.sequences[:, S_p:].cpu(),
+                "rollout_logits": rollout_logits.cpu(),
+            }
+
+            # ↓ 关键：对外的返回值恢复成调用方期望的格式
+            if original_return_dict:
+                return output                   # 调用方本来就要 dict，原样返回
+            else:
+                return output.sequences         # 调用方期望 Tensor，只返回 sequences
+
+
+        model.generate = patched_generate
+
+    def pop(self) -> Optional[Dict]:
+        """取出并清空 buffer。"""
+        buf = self._buffer
+        self._buffer = None
+        return buf
+
+    def detach(self, model):
+        if self._original_generate is not None:
+            model.generate = self._original_generate
+            self._original_generate = None
+
 
 # ─────────────────────────────────────────────
 # Rollout 日志包装器
@@ -105,6 +161,8 @@ class RolloutRewardWrapper:
         log_path: str,
         quality_output_dir: str = None,
         quality_cfg: QualityConfig = None,
+        analysis_output_dir: str = None,    # 新增
+        analysis_cfg: AnalysisConfig = None, # 新增
         max_text_len: int = 300,
     ):
         self.reward_fn = reward_fn
@@ -119,6 +177,36 @@ class RolloutRewardWrapper:
         self._quality_cfg = quality_cfg or QualityConfig()
         quality_dir = quality_output_dir or str(self.log_path.parent / "rollout_quality")
         self._quality_logger = QualityLogger(quality_dir)
+        
+        # 分析模块
+        self._analysis_cfg = analysis_cfg or AnalysisConfig()
+        analysis_dir = analysis_output_dir or str(self.log_path.parent / "rollout_analysis")
+        self._analysis_logger = AnalysisLogger(analysis_dir)
+
+        # 暂存 rollout logits（由外部在生成后调用 set_rollout_logits 传入）
+        self._pending_rollout_logits: Optional[List[torch.Tensor]] = None
+        self._pending_prompt_ids:     Optional[List[torch.Tensor]] = None
+        self._pending_response_ids:   Optional[List[torch.Tensor]] = None
+        self._model_ref = None   # 由外部调用 set_model 传入
+
+    def set_model(self, model):
+        """传入当前 policy model，用于 train full-forward。"""
+        self._model_ref = model
+
+    def set_rollout_data(
+        self,
+        prompt_ids:     List[torch.Tensor],   # 每条样本的 prompt token ids，list of (S_p,)
+        response_ids:   List[torch.Tensor],   # 每条样本的 response token ids，list of (S_r,)
+        rollout_logits: Optional[List[torch.Tensor]] = None,  # 每条样本的 rollout logits，list of (S_r, V)
+    ):
+        """
+        在 rollout 生成完成后、reward 计算前调用。
+        rollout_logits 如果训练框架没有保存可以传 None，
+        此时只做 train full-forward 侧的分析（task2），跳过 mismatch（task1）。
+        """
+        self._pending_prompt_ids     = prompt_ids
+        self._pending_response_ids   = response_ids
+        self._pending_rollout_logits = rollout_logits
 
     def __call__(self, completions, **kwargs):
         rewards = self.reward_fn(completions, **kwargs)
@@ -174,6 +262,69 @@ class RolloutRewardWrapper:
         step_agg = aggregate_step(sample_results)
         self._quality_logger.log_step(step_agg)
 
+        # ── 分析模块（task1 + task2）────────────────────────────────
+        cfg = self._analysis_cfg
+        should_analyze = (
+            self._model_ref is not None
+            and self._pending_response_ids is not None
+            and self._step % cfg.log_every_n_steps == 0
+        )
+
+        if should_analyze:
+            device = next(self._model_ref.parameters()).device
+            n_analyze = min(len(texts), cfg.max_samples_per_step)
+
+            analyses  = []
+            bad_flags = []
+            rwd_list  = []
+
+            for i in range(n_analyze):
+                prompt_ids   = self._pending_prompt_ids[i]
+                response_ids = self._pending_response_ids[i]
+                ro_logits    = (
+                    self._pending_rollout_logits[i]
+                    if self._pending_rollout_logits is not None
+                    else None
+                )
+
+                analysis = analyze_sample_logits(
+                    model          = self._model_ref,
+                    tokenizer      = None,          # 当前不需要 tokenizer
+                    prompt_ids     = prompt_ids,
+                    response_ids   = response_ids,
+                    rollout_logits = ro_logits,
+                    cfg            = cfg,
+                    device         = device,
+                )
+                analyses.append(analysis)
+
+                sr = sample_results[i]
+                bad_flags.append(sr["is_bad"])
+                rwd_list.append(reward_floats[i])
+
+                self._analysis_logger.log_sample(
+                    step      = self._step,
+                    sample_id = sr["sample_id"],
+                    is_bad    = sr["is_bad"],
+                    bad_types = sr["bad_types"],
+                    reward    = reward_floats[i],
+                    analysis  = analysis,
+                )
+
+            step_agg = aggregate_analysis_step(
+                step            = self._step,
+                sample_analyses = analyses,
+                is_bad_flags    = bad_flags,
+                rewards         = rwd_list,
+            )
+            self._analysis_logger.log_step(step_agg)
+
+            # 清空 pending
+            self._pending_prompt_ids     = None
+            self._pending_response_ids   = None
+            self._pending_rollout_logits = None
+
+
         return rewards
 
     def set_step(self, step: int):
@@ -182,6 +333,7 @@ class RolloutRewardWrapper:
     def close(self):
         self._log_file.close()
         self._quality_logger.close()
+        self._analysis_logger.close()
 
 
 
@@ -227,6 +379,7 @@ class MetisDiagnosticCallback(TrainerCallback):
         saturation_alert_threshold: float = 0.05,
         target_suffixes: list = None,
         rollout_wrappers: list = None,   # 传入 RolloutRewardWrapper 列表，用于同步 step
+        rollout_capture: RolloutLogitsCapture = None
     ):
         self.model = model
         self.output_dir = Path(output_dir)
@@ -248,6 +401,7 @@ class MetisDiagnosticCallback(TrainerCallback):
         self._do_rank_check = False
 
         self._register_hooks()
+        self._capture = rollout_capture
 
     # ── hook 注册 ──────────────────────────────
 
@@ -369,6 +523,16 @@ class MetisDiagnosticCallback(TrainerCallback):
         self._activation_buffer.clear()
         self._activation_tensor_buffer.clear()
         self._do_rank_check = False
+        
+        buf = self._capture.pop()
+        if buf is not None:
+            B = buf["prompt_ids"].shape[0]
+            for wrapper in self.rollout_wrappers:
+                wrapper.set_rollout_data(
+                    prompt_ids     = [buf["prompt_ids"][i]     for i in range(B)],
+                    response_ids   = [buf["response_ids"][i]   for i in range(B)],
+                    rollout_logits = [buf["rollout_logits"][i] for i in range(B)],
+                )
 
     def on_train_end(self, args, state, control, **kwargs):
         # 移除所有 hook
