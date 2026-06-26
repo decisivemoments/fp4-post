@@ -1,12 +1,26 @@
-Qwen2_5-0.5B-DPO*
-tmp*
+# Local editor state
+.vscode/
+
+# Python/runtime caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Training and analysis outputs
+outputs/
+tmp*/
+*.log
 train.log
 training_output.log
-.vscode/
-**/__pycache__
-**/activation_analysis
+events.out.tfevents*
+checkpoint-*/
+runs/
+wandb/
+
+# Model/checkpoint directories that may be created from ad-hoc runs
+Qwen2_5-0.5B*/
+Qwen2-0.5B*/
+activation_analysis/
+activation_plots/
+cross_step_plots/
 pic/
-grpo/Qwen2_5-0.5B*
-grpo/activation*
-grpo/Qwen2-0.5B*
-grpo/cross_step_plots
