@@ -13,6 +13,6 @@ tpu_env: []
 tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
-deepspeed_config:                     # 新增这一块
-  deepspeed_config_file: configs/grpo/ds_config_zero2.json
-  zero3_init_flag: false
+# deepspeed_config:                     # 新增这一块
+#   deepspeed_config_file: configs/grpo/ds_config_zero2.json
+#   zero3_init_flag: false

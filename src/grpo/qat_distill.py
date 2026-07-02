@@ -75,6 +75,10 @@ class QATScriptArguments(ScriptArguments):
         default=1,
         metadata={"help": "训练轮数。"}
     )
+    max_steps: int = field(
+        default=-1,
+        metadata={"help": "最大 optimizer step 数；>0 时优先于 num_train_epochs 提前停止。"}
+    )
     per_device_train_batch_size: int = field(
         default=1,
         metadata={"help": "每卡 batch size（prompt 数）。"}
@@ -101,6 +105,10 @@ class QATScriptArguments(ScriptArguments):
         default="qat_distill_output",
         metadata={"help": "输出目录。"}
     )
+    tensorboard_log_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "TensorBoard 日志目录；不传时使用 output_dir/runs。"}
+    )
     save_steps: int = field(
         default=100,
         metadata={"help": "每隔多少步保存一次 checkpoint。"}
@@ -114,6 +122,34 @@ class QATScriptArguments(ScriptArguments):
     use_metis: bool = field(
         default=True,
         metadata={"help": "是否对 student 启用 Metis fp4 替换。"}
+    )
+    metis_mode: str = field(
+        default="mean",
+        metadata={"help": "Metis activation residual mode. Supported by BitLinear: `mean` or `svd`."}
+    )
+    metis_enable_forward_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis decomposes weights into low-rank plus low-bit residual."}
+    )
+    metis_enable_activation_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis applies activation residual quantization. Disable for vanilla direct FP4."}
+    )
+    metis_enable_backward_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis applies low-rank/residual quantization to backward output gradients."}
+    )
+    metis_forward_svd_rank: int = field(
+        default=64,
+        metadata={"help": "Metis forward weight low-rank rank. Use 0 with forward SVD disabled for direct FP4."}
+    )
+    metis_activation_lowrank_svd: int = field(
+        default=64,
+        metadata={"help": "Metis activation low-rank rank used when activation residual quantization is enabled."}
+    )
+    metis_backward_lowrank_svd: int = field(
+        default=64,
+        metadata={"help": "Metis backward low-rank rank used when backward residual quantization is enabled."}
     )
     print_args: bool = field(
         default=True,
@@ -354,7 +390,16 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
     )
     if args.use_metis:
         accelerator.print("🔧 Replacing student layers with Metis BitLinear (fp4)...")
-        student_model = replace_model_with_metis(student_model)
+        metis_args = MetisArgs(
+            metis_mode=args.metis_mode,
+            enable_forward_svd=args.metis_enable_forward_svd,
+            enable_activation_svd=args.metis_enable_activation_svd,
+            enable_backward_svd=args.metis_enable_backward_svd,
+            forward_svd_rank=args.metis_forward_svd_rank,
+            activation_lowrank_svd=args.metis_activation_lowrank_svd,
+            backward_lowrank_svd=args.metis_backward_lowrank_svd,
+        )
+        student_model = replace_model_with_metis(student_model, metis_args)
 
     student_model.gradient_checkpointing_enable()
     
@@ -396,7 +441,7 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
     )
     
     if accelerator.is_main_process:
-        writer = SummaryWriter(log_dir=f"{args.output_dir}/runs")
+        writer = SummaryWriter(log_dir=args.tensorboard_log_dir or f"{args.output_dir}/runs")
     else:
         writer = None
 
@@ -405,6 +450,8 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
         * args.num_train_epochs
         // args.gradient_accumulation_steps
     )
+    if args.max_steps and args.max_steps > 0:
+        total_steps = min(total_steps, args.max_steps)
     warmup_steps = int(total_steps * args.warmup_ratio)
 
     scheduler = get_cosine_schedule_with_warmup(
@@ -437,6 +484,9 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
         top_k = args.kl_top_k if hasattr(args, 'kl_top_k') else -1  # 从配置读取，默认 -1（全量）
 
         for step, batch in enumerate(pbar):
+            if args.max_steps and args.max_steps > 0 and global_step >= args.max_steps:
+                break
+
             input_ids      = batch["input_ids"]
             attention_mask = batch["attention_mask"]
 
@@ -549,6 +599,9 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
                     )
                     if accelerator.is_main_process:
                         tokenizer.save_pretrained(save_path)
+
+        if args.max_steps and args.max_steps > 0 and global_step >= args.max_steps:
+            break
 
     # ── 最终保存 ──────────────────────────────
     accelerator.print("✅ Training complete.")

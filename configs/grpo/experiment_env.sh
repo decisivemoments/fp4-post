@@ -1,0 +1,57 @@
+# Shared paths and defaults for FP4 GRPO experiments.
+#
+# Override any value from the command line, for example:
+#   DATA_ROOT=/path/to/data MODEL_ROOT=/path/to/model bash scripts/grpo/run_experiment.sh grpo bf16 qwen2_0_5b
+
+export DATA_ROOT="${DATA_ROOT:-/inspire/ssd/project/pretrain-test/p-shangli/jyzhang/data}"
+export MODEL_ROOT="${MODEL_ROOT:-/inspire/ssd/project/pretrain-test/p-shangli/jyzhang/model}"
+export GRPO_OUTPUT_ROOT="${GRPO_OUTPUT_ROOT:-outputs/grpo}"
+export QAT_OUTPUT_ROOT="${QAT_OUTPUT_ROOT:-outputs/qat}"
+
+export TRAIN_DATASET="${TRAIN_DATASET:-${DATA_ROOT}/deepmath-103K}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+
+export ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/grpo/multi_gpu.yaml}"
+export ACCELERATE_DS_CONFIG="${ACCELERATE_DS_CONFIG:-configs/grpo/multi_gpu_ds.yaml}"
+export DEEPSPEED_CONFIG="${DEEPSPEED_CONFIG:-configs/grpo/ds_config_zero2_no_offload.json}"
+
+export REPORT_TO="${REPORT_TO:-tensorboard}"
+export REWARD_FUNCS="${REWARD_FUNCS:-accuracy_reward}"
+export DATASET_TRAIN_SPLIT="${DATASET_TRAIN_SPLIT:-train}"
+export DATASET_TEST_SPLIT="${DATASET_TEST_SPLIT:-test}"
+
+export GRPO_EPOCHS="${GRPO_EPOCHS:-1}"
+export GRPO_BATCH_SIZE="${GRPO_BATCH_SIZE:-64}"
+export GRPO_GRAD_ACCUM="${GRPO_GRAD_ACCUM:-1}"
+export GRPO_MAX_PROMPT_LENGTH="${GRPO_MAX_PROMPT_LENGTH:-1024}"
+export GRPO_MAX_COMPLETION_LENGTH="${GRPO_MAX_COMPLETION_LENGTH:-1024}"
+export GRPO_NUM_GENERATIONS="${GRPO_NUM_GENERATIONS:-8}"
+export GRPO_LEARNING_RATE="${GRPO_LEARNING_RATE:-1e-6}"
+export GRPO_SAVE_STEPS="${GRPO_SAVE_STEPS:-1000}"
+export GRPO_LOGGING_STEPS="${GRPO_LOGGING_STEPS:-1}"
+export GRPO_RESUME="${GRPO_RESUME:-false}"
+export GRPO_EVAL_STRATEGY="${GRPO_EVAL_STRATEGY:-no}"
+export GRPO_GENERATION_USE_CACHE="${GRPO_GENERATION_USE_CACHE:-true}"
+export GRPO_GRADIENT_CHECKPOINTING="${GRPO_GRADIENT_CHECKPOINTING:-false}"
+export ANALYZE_ROLLOUT="${ANALYZE_ROLLOUT:-false}"
+export USE_CUSTOM_ANALYSIS="${USE_CUSTOM_ANALYSIS:-false}"
+
+export QAT_EPOCHS="${QAT_EPOCHS:-1}"
+export QAT_BATCH_SIZE="${QAT_BATCH_SIZE:-8}"
+export QAT_GRAD_ACCUM="${QAT_GRAD_ACCUM:-8}"
+export QAT_LEARNING_RATE="${QAT_LEARNING_RATE:-1e-6}"
+export QAT_MAX_PROMPT_LENGTH="${QAT_MAX_PROMPT_LENGTH:-512}"
+export QAT_MAX_NEW_TOKENS="${QAT_MAX_NEW_TOKENS:-1024}"
+export QAT_KL_TOP_K="${QAT_KL_TOP_K:-100}"
+export QAT_SAVE_STEPS="${QAT_SAVE_STEPS:-500}"
+export QAT_LOGGING_STEPS="${QAT_LOGGING_STEPS:-10}"
+
+export METIS_WEIGHT_SVD="${METIS_WEIGHT_SVD:-true}"
+export METIS_WEIGHT_SVD_RANK="${METIS_WEIGHT_SVD_RANK:-64}"
+export METIS_ACTIVATION_GRAD_RANK="${METIS_ACTIVATION_GRAD_RANK:-64}"
+
+# export EVALSCOPE_DATASETS="${EVALSCOPE_DATASETS:-aime24 aime25 amc math_500 arc gpqa_diamond mmlu_pro}"
+export EVALSCOPE_DATASETS="${EVALSCOPE_DATASETS:-aime24 aime25 amc math_500 arc gpqa_diamond }"
+export EVALSCOPE_DATASET_HUB="${EVALSCOPE_DATASET_HUB:-Local}"
+export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
+export EVALSCOPE_OUTPUT_ROOT="${EVALSCOPE_OUTPUT_ROOT:-outputs/evalscope}"

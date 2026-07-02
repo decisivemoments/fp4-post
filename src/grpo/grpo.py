@@ -60,9 +60,18 @@ from rollout_quality import QualityConfig, QualityAnalyzer
 
 class MetisArgs:
     """Metis 配置参数"""
-    def __init__(self):
+    def __init__(
+        self,
+        metis_mode: str = "mean",
+        enable_forward_svd: bool = True,
+        enable_activation_svd: bool = True,
+        enable_backward_svd: bool = True,
+        forward_svd_rank: int = 64,
+        activation_lowrank_svd: int = 64,
+        backward_lowrank_svd: int = 64,
+    ):
         self.device = "cuda"
-        self.enable_forward_svd = True
+        self.enable_forward_svd = enable_forward_svd
         self.enable_lowbit = True
         self.enable_te = False
         
@@ -72,12 +81,12 @@ class MetisArgs:
         self.q_backward_weight = "nvfp4e2m1b"
         self.q_backward_outputgrad = "nvfp4e2m1b"
         
-        self.enable_backward_svd = True
-        self.backward_lowrank_svd = 64
+        self.enable_backward_svd = enable_backward_svd
+        self.backward_lowrank_svd = backward_lowrank_svd
         self.backward_lowrank_niter = 2
         
-        self.enable_activation_svd = True
-        self.activation_lowrank_svd = 64
+        self.enable_activation_svd = enable_activation_svd
+        self.activation_lowrank_svd = activation_lowrank_svd
         self.activation_lowrank_niter = 0
         
         self.activation_broadcast_dim = 0
@@ -89,11 +98,11 @@ class MetisArgs:
         self.gradacc_broadcast_steps = 1
         
         self.forward_svd_warmup_steps = 50 #we will split manually after replace nn.linear with bitlinear
-        self.forward_svd_rank = 64
+        self.forward_svd_rank = forward_svd_rank
         self.tp_simulation = False
         self.tp_parts = 4
 
-        self.metis_mode = "mean"  # 可选 "svd" 或 "mean"
+        self.metis_mode = metis_mode  # 可选 "svd" 或 "mean"
 
 def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, compute_dtype=None):
     """
@@ -311,9 +320,42 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "whether analyze rollout text quality, token entropy, probability, token, mismatch"}
     )
 
+    generation_use_cache: bool = field(
+        default=True,
+        metadata={"help": "Whether to force use_cache for rollout generation."}
+    )
+
     use_metis: bool = field(
         default=False,
         metadata={"help": "Whether to use Metis to fp4 train."}
+    )
+    metis_mode: str = field(
+        default="mean",
+        metadata={"help": "Metis activation residual mode. Supported by BitLinear: `mean` or `svd`."}
+    )
+    metis_enable_forward_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis decomposes weights into low-rank plus low-bit residual."}
+    )
+    metis_enable_activation_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis applies activation residual quantization. Disable for vanilla direct FP4."}
+    )
+    metis_enable_backward_svd: bool = field(
+        default=True,
+        metadata={"help": "Whether Metis applies low-rank/residual quantization to backward output gradients."}
+    )
+    metis_forward_svd_rank: int = field(
+        default=64,
+        metadata={"help": "Metis forward weight low-rank rank. Use 0 with forward SVD disabled for direct FP4."}
+    )
+    metis_activation_lowrank_svd: int = field(
+        default=64,
+        metadata={"help": "Metis activation low-rank rank used when activation residual quantization is enabled."}
+    )
+    metis_backward_lowrank_svd: int = field(
+        default=64,
+        metadata={"help": "Metis backward low-rank rank used when backward residual quantization is enabled."}
     )
 
     print_args: bool = field(
@@ -533,7 +575,29 @@ def main(script_args, training_args, model_args, dataset_args):
     model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs)
     if script_args.use_metis:
         print("use metis, we will replace layer with metis")
-        model = replace_model_with_metis(model)
+        metis_args = MetisArgs(
+            metis_mode=script_args.metis_mode,
+            enable_forward_svd=script_args.metis_enable_forward_svd,
+            enable_activation_svd=script_args.metis_enable_activation_svd,
+            enable_backward_svd=script_args.metis_enable_backward_svd,
+            forward_svd_rank=script_args.metis_forward_svd_rank,
+            activation_lowrank_svd=script_args.metis_activation_lowrank_svd,
+            backward_lowrank_svd=script_args.metis_backward_lowrank_svd,
+        )
+        model = replace_model_with_metis(model, metis_args)
+
+    if hasattr(model, "generation_config") and model.generation_config is not None:
+        model.generation_config.use_cache = script_args.generation_use_cache
+
+    original_generate = model.generate
+
+    def generate_with_cache(*args, **kwargs):
+        kwargs.setdefault("use_cache", script_args.generation_use_cache)
+        return original_generate(*args, **kwargs)
+
+    model.generate = generate_with_cache
+    print(f"Rollout generation use_cache={script_args.generation_use_cache}")
+    print(f"Training gradient_checkpointing={training_args.gradient_checkpointing}")
 
     rollout_wrappers = []
     if script_args.analyze_rollout and len(reward_funcs) > 0 and callable(reward_funcs[0]):
@@ -598,7 +662,7 @@ def main(script_args, training_args, model_args, dataset_args):
         # analyzer = DiagnosticsAnalyzer(training_args.output_dir)
         # analyzer.print_summary()
         # analyzer.plot_all()
-        analyzer = QualityAnalyzer(output_dir + "/rollout_quality")
+        analyzer = QualityAnalyzer(os.path.join(training_args.output_dir, "rollout_quality"))
         analyzer.plot_all()
 
     # Save and push to Hub
