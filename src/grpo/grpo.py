@@ -118,6 +118,8 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
     if compute_dtype is None:
         compute_dtype = torch.float32
     
+    activation_groups = {}
+
     for name, module in list(model.named_modules()):  # ← list化防止替换时迭代器失效
         if name.split('.')[-1] not in target_modules:
             continue
@@ -162,6 +164,23 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
                     new_layer.warmup_linear.bias.copy_(module.bias)
         
         new_layer.layer_name = name  # ← 赋全名，供 mean_cache key 使用
+        projection_name = name.rsplit('.', 1)[-1]
+        if projection_name in {"q_proj", "k_proj", "v_proj"}:
+            group_name = f"{name.rsplit('.', 1)[0]}.qkv"
+        elif projection_name in {"gate_proj", "up_proj"}:
+            group_name = f"{name.rsplit('.', 1)[0]}.gate_up"
+        else:
+            group_name = None
+        if group_name is not None:
+            new_layer.activation_group = activation_groups.setdefault(
+                group_name,
+                {
+                    "name": group_name,
+                    "mean_cache": {},
+                    "input_ref": None,
+                    "quantized_input": None,
+                },
+            )
         new_layer.split()
         setattr(parent, child_name, new_layer)
     

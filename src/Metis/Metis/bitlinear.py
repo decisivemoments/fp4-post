@@ -4,6 +4,7 @@ import torch.nn.init as init
 # import transformer_engine.pytorch  as te
 
 from functools import partial
+import weakref
 
 import math
 # from scipy.linalg import hadamard
@@ -506,7 +507,36 @@ class BitLinear(nn.Module):
             self.split()
         
         self.mean_cache = {}
+        self.activation_group = None
         self.layer_name = ""  # 由 convert_to_metis 赋值
+
+    def _get_shared_quantized_input(self, x: torch.Tensor) -> torch.Tensor:
+        group = getattr(self, "activation_group", None)
+        if group is None:
+            return LinearLowbitFunction.quantize_input(
+                x,
+                mean_cache=self.mean_cache,
+                cache_key=f"{self.layer_name}.shared",
+            )
+
+        input_ref = group.get("input_ref")
+        if input_ref is not None and input_ref() is x:
+            return group["quantized_input"]
+
+        quantized_input = LinearLowbitFunction.quantize_input(
+            x,
+            mean_cache=group["mean_cache"],
+            cache_key=f"{group['name']}.shared",
+        )
+
+        def clear_cached_input(ref):
+            if group.get("input_ref") is ref:
+                group["input_ref"] = None
+                group["quantized_input"] = None
+
+        group["input_ref"] = weakref.ref(x, clear_cached_input)
+        group["quantized_input"] = quantized_input
+        return quantized_input
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         LinearLowbitFunction.mean_cache = self.mean_cache
@@ -517,11 +547,7 @@ class BitLinear(nn.Module):
                 and self.args.forward_svd_rank > 0
             )
             if share_activation:
-                shared_input = LinearLowbitFunction.quantize_input(
-                    x,
-                    mean_cache=self.mean_cache,
-                    cache_key=f"{self.layer_name}.shared",
-                )
+                shared_input = self._get_shared_quantized_input(x)
                 y = self.vlinear(x, quantized_input=shared_input)
             else:
                 LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.vlinear"

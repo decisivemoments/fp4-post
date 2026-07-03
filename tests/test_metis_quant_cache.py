@@ -116,6 +116,7 @@ def test_bitlinear_svd_branches_share_one_quantized_activation():
     layer.args = args
     layer.is_svd_quant = True
     layer.mean_cache = {}
+    layer.activation_group = None
     layer.layer_name = "test.layer"
     layer.vlinear = LinearLowbit(16, 4, bias=False, args=args)
     layer.ulinear = torch.nn.Linear(4, 8, bias=False)
@@ -143,3 +144,63 @@ def test_bitlinear_svd_branches_share_one_quantized_activation():
     assert x.grad is not None
     assert layer.vlinear.weight.grad is not None
     assert layer.warmup_linear.weight.grad is not None
+
+
+def test_projection_group_reuses_quantized_activation():
+    class CountingActivationQuant(Cast2Fp32):
+        calls = 0
+
+        @classmethod
+        def quantize_dequantize(cls, value):
+            cls.calls += 1
+            return value
+
+    args = SimpleNamespace(
+        device="cpu",
+        cache_quantized_weight=False,
+        forward_svd_rank=4,
+    )
+    group = {
+        "name": "test.attention.qkv",
+        "mean_cache": {},
+        "input_ref": None,
+        "quantized_input": None,
+    }
+
+    def make_layer(name):
+        layer = BitLinear.__new__(BitLinear)
+        torch.nn.Module.__init__(layer)
+        layer.args = args
+        layer.is_svd_quant = True
+        layer.mean_cache = {}
+        layer.activation_group = group
+        layer.layer_name = name
+        layer.vlinear = LinearLowbit(16, 4, bias=False, args=args)
+        layer.ulinear = torch.nn.Linear(4, 8, bias=False)
+        layer.warmup_linear = LinearLowbit(16, 8, bias=False, args=args)
+        layer.s = torch.nn.Parameter(torch.ones(4))
+        return layer
+
+    q_proj = make_layer("test.attention.q_proj")
+    k_proj = make_layer("test.attention.k_proj")
+    LinearLowbitFunction.compute_dtype = torch.float32
+    LinearLowbitFunction.q_forward_input = CountingActivationQuant
+    LinearLowbitFunction.q_forward_weight = Cast2Fp32
+    LinearLowbitFunction.q_backward_outputgrad = Cast2Fp32
+    LinearLowbitFunction.enable_activation_svd = True
+    LinearLowbitFunction.activation_lowrank_svd = 4
+    LinearLowbitFunction.activation_lowrank_niter = 0
+    LinearLowbitFunction.activation_broadcast_dim = -1
+    LinearLowbitFunction.tp_simulate = False
+    LinearLowbitFunction.tp_parts = 1
+    LinearLowbitFunction.metis_mode = "mean"
+    LinearLowbitFunction.enable_nv_recipe = False
+    LinearLowbitFunction.enable_backward_svd = False
+
+    x = torch.randn(2, 3, 16, requires_grad=True)
+    (q_proj(x).sum() + k_proj(x).sum()).backward()
+
+    assert CountingActivationQuant.calls == 1
+    assert x.grad is not None
+    assert q_proj.vlinear.weight.grad is not None
+    assert k_proj.vlinear.weight.grad is not None
