@@ -50,6 +50,8 @@ class LinearLowbitFunction(torch.autograd.Function):
     
     compute_dtype = torch.float32
     metis_mode = "mean"  # 可选 "svd" 或 "mean"
+    mean_cache = None
+    mean_cache_key = "default"
     
     @staticmethod
     def svd_quant(
@@ -210,26 +212,21 @@ class LinearLowbitFunction(torch.autograd.Function):
 
     
     @staticmethod
-    def forward(
-        ctx,
+    def quantize_input(
         input_: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor,
-        quantized_weight: torch.Tensor,
-    ):
-        input_original_dtype = input_.dtype
+        mean_cache: dict = None,
+        cache_key: str = "default",
+    ) -> torch.Tensor:
         input_ = input_.to(LinearLowbitFunction.compute_dtype)
-
         idim = input_.shape[-1]
         if (not hasattr(LinearLowbitFunction, "h")) and LinearLowbitFunction.enable_nv_recipe:
             LinearLowbitFunction.hdim = 4096
             H_scipy = hadamard(LinearLowbitFunction.hdim)
-            LinearLowbitFunction.h = torch.from_numpy(H_scipy).float().to(weight.device)
-        
+            LinearLowbitFunction.h = torch.from_numpy(H_scipy).float().to(input_.device)
 
         if LinearLowbitFunction.enable_activation_svd:
-            input_ = LinearLowbitFunction.svd_quant(
-                input_, 
+            return LinearLowbitFunction.svd_quant(
+                input_,
                 quant_func=LinearLowbitFunction.q_forward_input,
                 rank=LinearLowbitFunction.activation_lowrank_svd,
                 niter=LinearLowbitFunction.activation_lowrank_niter,
@@ -237,17 +234,35 @@ class LinearLowbitFunction(torch.autograd.Function):
                 tp_simulate=LinearLowbitFunction.tp_simulate,
                 tp_parts=LinearLowbitFunction.tp_parts,
                 metis_mode=LinearLowbitFunction.metis_mode,
-                mean_cache=LinearLowbitFunction.mean_cache,        
-                cache_key=LinearLowbitFunction.mean_cache_key,     
+                mean_cache=mean_cache,
+                cache_key=cache_key,
+            )
+
+        if LinearLowbitFunction.enable_nv_recipe:
+            input_ = input_ @ LinearLowbitFunction.h[:idim]
+        input_ = LinearLowbitFunction.q_forward_input.quantize_dequantize(input_)
+        if LinearLowbitFunction.enable_nv_recipe:
+            input_ = input_ @ LinearLowbitFunction.h[:idim].mT / LinearLowbitFunction.hdim
+        return input_
+
+    @staticmethod
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        quantized_weight: torch.Tensor,
+        quantized_input: torch.Tensor | None,
+    ):
+        input_original_dtype = input_.dtype
+        if quantized_input is None:
+            input_ = LinearLowbitFunction.quantize_input(
+                input_,
+                mean_cache=LinearLowbitFunction.mean_cache,
+                cache_key=LinearLowbitFunction.mean_cache_key,
             )
         else:
-            
-            if LinearLowbitFunction.enable_nv_recipe:
-                input_ = input_ @ LinearLowbitFunction.h[: idim]
-            
-            input_ = LinearLowbitFunction.q_forward_input.quantize_dequantize(input_)
-            if LinearLowbitFunction.enable_nv_recipe:
-                input_ = input_ @ LinearLowbitFunction.h[: idim].mT / LinearLowbitFunction.hdim
+            input_ = quantized_input
     
         
         ctx.save_for_backward(
@@ -337,7 +352,7 @@ class LinearLowbitFunction(torch.autograd.Function):
         grad_weight = grad_weight.to(torch.float32)
         grad_bias = grad_bias.to(torch.float32) if grad_bias is not None else None
         
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 class LinearLowbit(torch.nn.Module):
     def __init__(
@@ -375,11 +390,17 @@ class LinearLowbit(torch.nn.Module):
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             init.uniform_(self.bias, -bound, bound)
     
-    def forward(self, input):
+    def forward(self, input, quantized_input=None):
         weight_compute = self.weight.to(self.compute_dtype)
         bias_compute = self.bias.to(self.compute_dtype) if self.bias is not None else None
         quantized_weight = self._get_quantized_weight(weight_compute)
-        return LinearLowbitFunction.apply(input, weight_compute, bias_compute, quantized_weight)
+        return LinearLowbitFunction.apply(
+            input,
+            weight_compute,
+            bias_compute,
+            quantized_weight,
+            quantized_input,
+        )
 
     @torch.no_grad()
     def _get_quantized_weight(self, weight_compute):
@@ -490,13 +511,29 @@ class BitLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         LinearLowbitFunction.mean_cache = self.mean_cache
         if self.is_svd_quant:
-            LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.vlinear"
-            y = self.vlinear(x)
+            share_activation = (
+                isinstance(self.vlinear, LinearLowbit)
+                and isinstance(self.warmup_linear, LinearLowbit)
+                and self.args.forward_svd_rank > 0
+            )
+            if share_activation:
+                shared_input = LinearLowbitFunction.quantize_input(
+                    x,
+                    mean_cache=self.mean_cache,
+                    cache_key=f"{self.layer_name}.shared",
+                )
+                y = self.vlinear(x, quantized_input=shared_input)
+            else:
+                LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.vlinear"
+                y = self.vlinear(x)
             y = torch.mul(self.s, y)
             y = self.ulinear(y)
             if self.args.forward_svd_rank > 0:
-                LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.warmup"
-                y = y + self.warmup_linear(x)
+                if share_activation:
+                    y = y + self.warmup_linear(x, quantized_input=shared_input)
+                else:
+                    LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.warmup"
+                    y = y + self.warmup_linear(x)
             
             
         else:

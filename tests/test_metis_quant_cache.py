@@ -1,9 +1,11 @@
+#PYTHONPATH=src pytest -q tests/test_metis_quant_cache.py
+
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from Metis.Metis.bitlinear import LinearLowbit, LinearLowbitFunction
+from Metis.Metis.bitlinear import BitLinear, LinearLowbit, LinearLowbitFunction
 from Metis.Metis.quant import (
     Cast2Fp32,
     Cast2NVFp4e2m1BlockNOSR,
@@ -93,3 +95,51 @@ def test_mean_activation_path_uses_quantize_dequantize():
 
     assert output.shape == x.shape
     assert CountingQuant.calls == 1
+
+
+def test_bitlinear_svd_branches_share_one_quantized_activation():
+    class CountingActivationQuant(Cast2Fp32):
+        calls = 0
+
+        @classmethod
+        def quantize_dequantize(cls, value):
+            cls.calls += 1
+            return value
+
+    args = SimpleNamespace(
+        device="cpu",
+        cache_quantized_weight=False,
+        forward_svd_rank=4,
+    )
+    layer = BitLinear.__new__(BitLinear)
+    torch.nn.Module.__init__(layer)
+    layer.args = args
+    layer.is_svd_quant = True
+    layer.mean_cache = {}
+    layer.layer_name = "test.layer"
+    layer.vlinear = LinearLowbit(16, 4, bias=False, args=args)
+    layer.ulinear = torch.nn.Linear(4, 8, bias=False)
+    layer.warmup_linear = LinearLowbit(16, 8, bias=False, args=args)
+    layer.s = torch.nn.Parameter(torch.ones(4))
+
+    LinearLowbitFunction.compute_dtype = torch.float32
+    LinearLowbitFunction.q_forward_input = CountingActivationQuant
+    LinearLowbitFunction.q_forward_weight = Cast2Fp32
+    LinearLowbitFunction.q_backward_outputgrad = Cast2Fp32
+    LinearLowbitFunction.enable_activation_svd = True
+    LinearLowbitFunction.activation_lowrank_svd = 4
+    LinearLowbitFunction.activation_lowrank_niter = 0
+    LinearLowbitFunction.activation_broadcast_dim = -1
+    LinearLowbitFunction.tp_simulate = False
+    LinearLowbitFunction.tp_parts = 1
+    LinearLowbitFunction.metis_mode = "mean"
+    LinearLowbitFunction.enable_nv_recipe = False
+    LinearLowbitFunction.enable_backward_svd = False
+
+    x = torch.randn(2, 3, 16, requires_grad=True)
+    layer(x).sum().backward()
+
+    assert CountingActivationQuant.calls == 1
+    assert x.grad is not None
+    assert layer.vlinear.weight.grad is not None
+    assert layer.warmup_linear.weight.grad is not None
