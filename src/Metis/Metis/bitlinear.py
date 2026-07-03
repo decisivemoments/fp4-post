@@ -139,9 +139,7 @@ class LinearLowbitFunction(torch.autograd.Function):
 
             # --- 残差量化 ---
             input_res = input_flat - ker
-            input_res_scalar = quant_func.get_scalar(input_res)
-            input_res = quant_func.quant(input_res, input_res_scalar)
-            input_res = quant_func.rquant(input_res, input_res_scalar)
+            input_res = quant_func.quantize_dequantize(input_res)
 
             out = ker + input_res
 
@@ -153,8 +151,7 @@ class LinearLowbitFunction(torch.autograd.Function):
 
         def _mean_quant_single(input_: torch.Tensor) -> torch.Tensor:
             original_shape = input_.shape
-            if len(original_shape) == 3:
-                input_flat = input_.reshape(-1, original_shape[-1])
+            input_flat = input_.reshape(-1, original_shape[-1])
             seq_len = original_shape[1] if len(original_shape) == 3 else original_shape[0]
             if seq_len == 1 and mean_cache is not None and cache_key in mean_cache:
                 # Decode：加权滚动更新
@@ -172,9 +169,7 @@ class LinearLowbitFunction(torch.autograd.Function):
                     mean_cache[cache_key] = (me.detach(), input_flat.shape[0])
 
             input_res = input_flat - me
-            input_res_scalar = quant_func.get_scalar(input_res)
-            input_res = quant_func.quant(input_res, input_res_scalar)
-            input_res = quant_func.rquant(input_res, input_res_scalar)
+            input_res = quant_func.quantize_dequantize(input_res)
             input_ = me + input_res
 
             if len(original_shape) == 3:
@@ -215,11 +210,16 @@ class LinearLowbitFunction(torch.autograd.Function):
 
     
     @staticmethod
-    def forward(ctx, input_: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
+    def forward(
+        ctx,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        quantized_weight: torch.Tensor,
+    ):
         input_original_dtype = input_.dtype
         input_ = input_.to(LinearLowbitFunction.compute_dtype)
-        
-        wdim = weight.shape[-1]
+
         idim = input_.shape[-1]
         if (not hasattr(LinearLowbitFunction, "h")) and LinearLowbitFunction.enable_nv_recipe:
             LinearLowbitFunction.hdim = 4096
@@ -240,39 +240,25 @@ class LinearLowbitFunction(torch.autograd.Function):
                 mean_cache=LinearLowbitFunction.mean_cache,        
                 cache_key=LinearLowbitFunction.mean_cache_key,     
             )
-            input_scalar = LinearLowbitFunction.q_forward_input.get_scalar(input_)
         else:
             
             if LinearLowbitFunction.enable_nv_recipe:
                 input_ = input_ @ LinearLowbitFunction.h[: idim]
             
-            input_scalar = LinearLowbitFunction.q_forward_input.get_scalar(input_)
-            input_ = LinearLowbitFunction.q_forward_input.quant(input_, input_scalar)
-            input_ = LinearLowbitFunction.q_forward_input.rquant(input_, input_scalar)
+            input_ = LinearLowbitFunction.q_forward_input.quantize_dequantize(input_)
             if LinearLowbitFunction.enable_nv_recipe:
                 input_ = input_ @ LinearLowbitFunction.h[: idim].mT / LinearLowbitFunction.hdim
     
         
-        if LinearLowbitFunction.enable_nv_recipe:
-            weight = weight @ LinearLowbitFunction.h[: wdim]
-        weight_scalar = LinearLowbitFunction.q_forward_input.get_scalar(weight)
-        weight = LinearLowbitFunction.q_forward_weight.quant(weight, weight_scalar)
-        weight = LinearLowbitFunction.q_forward_weight.rquant(weight, weight_scalar)
-        if LinearLowbitFunction.enable_nv_recipe:
-            weight = weight @ LinearLowbitFunction.h[: wdim].mT / LinearLowbitFunction.hdim
-            
-            
         ctx.save_for_backward(
             input_, 
-            weight, 
-            input_scalar, 
-            weight_scalar, 
+            quantized_weight,
             bias
         )
         
         
         
-        output = torch.matmul(input_, weight.T)
+        output = torch.matmul(input_, quantized_weight.T)
         
         if bias is not None:
             output += bias
@@ -282,7 +268,7 @@ class LinearLowbitFunction(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        input_, weight, input_scalar, weight_scalar, bias = ctx.saved_tensors
+        input_, weight, bias = ctx.saved_tensors
 
         # input_ = LinearLowbitFunction.q_backward_input.quant(input_, input_scalar)
         # weight = LinearLowbitFunction.q_backward_weight.quant(weight, weight_scalar)
@@ -351,7 +337,7 @@ class LinearLowbitFunction(torch.autograd.Function):
         grad_weight = grad_weight.to(torch.float32)
         grad_bias = grad_bias.to(torch.float32) if grad_bias is not None else None
         
-        return grad_input, grad_weight, grad_bias
+        return grad_input, grad_weight, grad_bias, None
 
 class LinearLowbit(torch.nn.Module):
     def __init__(
@@ -369,6 +355,8 @@ class LinearLowbit(torch.nn.Module):
         self.out_features = out_features
         self.storage_dtype = storage_dtype
         self.compute_dtype = compute_dtype
+        self.cache_quantized_weight = getattr(args, "cache_quantized_weight", False)
+        self._quantized_weight_cache = None
         self.weight = torch.nn.Parameter(
             torch.empty((out_features, in_features), dtype=storage_dtype, device=args.device if device is None else device)
         )
@@ -390,7 +378,40 @@ class LinearLowbit(torch.nn.Module):
     def forward(self, input):
         weight_compute = self.weight.to(self.compute_dtype)
         bias_compute = self.bias.to(self.compute_dtype) if self.bias is not None else None
-        return LinearLowbitFunction.apply(input, weight_compute, bias_compute)
+        quantized_weight = self._get_quantized_weight(weight_compute)
+        return LinearLowbitFunction.apply(input, weight_compute, bias_compute, quantized_weight)
+
+    @torch.no_grad()
+    def _get_quantized_weight(self, weight_compute):
+        cache_key = (
+            self.weight._version,
+            weight_compute.device,
+            weight_compute.dtype,
+            LinearLowbitFunction.q_forward_weight,
+            LinearLowbitFunction.enable_nv_recipe,
+        )
+        if self.cache_quantized_weight and self._quantized_weight_cache is not None:
+            cached_key, cached_weight = self._quantized_weight_cache
+            if cached_key == cache_key:
+                return cached_weight
+
+        quant_input = weight_compute
+        if LinearLowbitFunction.enable_nv_recipe:
+            wdim = quant_input.shape[-1]
+            quant_input = quant_input @ LinearLowbitFunction.h[:wdim]
+        quantized_weight = LinearLowbitFunction.q_forward_weight.quantize_dequantize(quant_input)
+        if LinearLowbitFunction.enable_nv_recipe:
+            quantized_weight = (
+                quantized_weight @ LinearLowbitFunction.h[:wdim].mT / LinearLowbitFunction.hdim
+            )
+
+        if self.cache_quantized_weight:
+            self._quantized_weight_cache = (cache_key, quantized_weight)
+        return quantized_weight
+
+    def _apply(self, fn, recurse=True):
+        self._quantized_weight_cache = None
+        return super()._apply(fn, recurse=recurse)
 
     pass
 
@@ -431,6 +452,9 @@ class BitLinear(nn.Module):
 
         LinearLowbitFunction.q_forward_input = quant_func[args.q_forward_input]
         LinearLowbitFunction.q_forward_weight = quant_func[args.q_forward_weight]
+        compile_qdq = getattr(args, "compile_qdq", False)
+        LinearLowbitFunction.q_forward_input.compile_quantize_dequantize = compile_qdq
+        LinearLowbitFunction.q_forward_weight.compile_quantize_dequantize = compile_qdq
         LinearLowbitFunction.q_backward_input = quant_func[args.q_backward_input]
         LinearLowbitFunction.q_backward_weight = quant_func[args.q_backward_weight]
         LinearLowbitFunction.q_backward_outputgrad = quant_func[args.q_backward_outputgrad]
@@ -650,4 +674,3 @@ class BitLinear(nn.Module):
         W.copy_(W_lowrank.to(dtype=W.dtype, device=W.device))
 
         print(f"[lowrank_init] shape={tuple(W.shape)}  rank={r}")
-        

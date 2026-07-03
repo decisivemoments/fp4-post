@@ -1,8 +1,81 @@
 
 import torch
+import warnings
+
+
+def _nvfp4_nosr_quantize_dequantize(x: torch.Tensor):
+    """Fused eager graph for NVFP4 block quantization simulation."""
+    original_shape = x.shape
+    flat = x.reshape(-1, x.shape[-1])
+    rows, cols = flat.shape
+    block_rows, block_cols = 1, 16
+
+    blocks = flat.view(
+        rows // block_rows,
+        block_rows,
+        cols // block_cols,
+        block_cols,
+    )
+    scalar = blocks.abs().amax(dim=(1, 3), keepdim=True) / 6 + 1e-9
+
+    scalar_max = scalar.abs().amax()
+    scalar_unit = scalar_max / 448
+    dequant_scalar = (scalar / scalar_unit).to(torch.float8_e4m3fn).to(scalar.dtype)
+    dequant_scalar = dequant_scalar * scalar_unit
+
+    sign = blocks.sign()
+    quantized = blocks.abs() / (scalar / 2)
+    quantized = quantized - (
+        torch.relu(quantized - 4) / 2 + torch.relu(quantized - 8) / 4
+    )
+    quantized = torch.round(quantized)
+    quantized = quantized + (
+        torch.relu(quantized - 4) + torch.relu(quantized - 6) * 2
+    )
+    output = quantized * sign / 2 * dequant_scalar
+    return output.reshape(original_shape)
+
+
+_compiled_nvfp4_nosr_qdq = None
+_compiled_nvfp4_nosr_qdq_validated = False
+_compiled_nvfp4_nosr_qdq_disabled_reason = None
+
+
+def _get_compiled_nvfp4_nosr_qdq():
+    global _compiled_nvfp4_nosr_qdq
+    if _compiled_nvfp4_nosr_qdq is None:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError("METIS_COMPILE_QDQ requires torch.compile support")
+        _compiled_nvfp4_nosr_qdq = torch.compile(
+            _nvfp4_nosr_quantize_dequantize,
+            dynamic=True,
+            fullgraph=True,
+            options={
+                "emulate_precision_casts": True,
+                # "division_rounding": True,
+            },
+        )
+    return _compiled_nvfp4_nosr_qdq
+
+
+def nvfp4_nosr_qdq_compile_status():
+    if _compiled_nvfp4_nosr_qdq_disabled_reason is not None:
+        return f"disabled: {_compiled_nvfp4_nosr_qdq_disabled_reason}"
+    if _compiled_nvfp4_nosr_qdq_validated:
+        return "validated"
+    return "not validated"
 
 
 class QuantFunc:
+    compile_quantize_dequantize = False
+
+    @classmethod
+    @torch.no_grad()
+    def quantize_dequantize(cls, x: torch.Tensor):
+        """Return the simulated low-bit value after dequantization."""
+        scalar = cls.get_scalar(x)
+        return cls.rquant(cls.quant(x, scalar), scalar)
+
     @classmethod
     @torch.no_grad()
     def get_scalar(cls, x: torch.Tensor):
@@ -315,6 +388,50 @@ class Cast2NVFp4e2m1Block(BlockQuantFunc):
         return Cast2Fp4e2m1.rquant(x, s).view(xshape)
     
 class Cast2NVFp4e2m1BlockNOSR(BlockQuantFunc):
+    @classmethod
+    @torch.no_grad()
+    def quantize_dequantize(cls, x: torch.Tensor):
+        global _compiled_nvfp4_nosr_qdq_validated
+        global _compiled_nvfp4_nosr_qdq_disabled_reason
+
+        rows = x.numel() // x.shape[-1]
+        cols = x.shape[-1]
+        block_rows, block_cols = cls.block_shape
+        if rows % block_rows != 0 or cols % block_cols != 0:
+            raise ValueError(
+                f"NVFP4 block shape {cls.block_shape} does not divide tensor shape {tuple(x.shape)}"
+            )
+        if not cls.compile_quantize_dequantize or _compiled_nvfp4_nosr_qdq_disabled_reason is not None:
+            return _nvfp4_nosr_quantize_dequantize(x)
+
+        try:
+            compiled_output = _get_compiled_nvfp4_nosr_qdq()(x)
+        except Exception as error:
+            _compiled_nvfp4_nosr_qdq_disabled_reason = (
+                f"torch.compile failed with {type(error).__name__}: {error}"
+            )
+            warnings.warn(
+                "Disabling compiled NVFP4 QDQ because compilation failed: "
+                f"{_compiled_nvfp4_nosr_qdq_disabled_reason}",
+                RuntimeWarning,
+            )
+            return _nvfp4_nosr_quantize_dequantize(x)
+        if not _compiled_nvfp4_nosr_qdq_validated:
+            eager_output = _nvfp4_nosr_quantize_dequantize(x)
+            if not torch.equal(compiled_output, eager_output):
+                mismatch = (compiled_output != eager_output).sum().item()
+                _compiled_nvfp4_nosr_qdq_disabled_reason = (
+                    f"compiled output differed from eager output at {mismatch}/{x.numel()} elements"
+                )
+                warnings.warn(
+                    "Disabling compiled NVFP4 QDQ because exact eager equivalence validation failed: "
+                    f"{_compiled_nvfp4_nosr_qdq_disabled_reason}",
+                    RuntimeWarning,
+                )
+                return eager_output
+            _compiled_nvfp4_nosr_qdq_validated = True
+        return compiled_output
+
     @classmethod
     @torch.no_grad()
     def get_scalar(cls, x: torch.Tensor):

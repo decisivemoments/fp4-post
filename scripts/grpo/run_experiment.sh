@@ -42,8 +42,10 @@ Useful overrides:
   MODEL_ENV_FILE=configs/grpo/model_env/qwen2_0_5b.sh
   DEEPSPEED_CONFIG=configs/grpo/ds_config_zero2.json
   GRPO_GENERATION_USE_CACHE=true
-  GRPO_GRADIENT_CHECKPOINTING=false
+  GRPO_GRADIENT_CHECKPOINTING=true
   METIS_WEIGHT_SVD=true METIS_WEIGHT_SVD_RANK=64 METIS_ACTIVATION_GRAD_RANK=64
+  METIS_CACHE_QUANTIZED_WEIGHT=true  # uses extra GPU memory
+  METIS_COMPILE_QDQ=true             # compile fused NVFP4 QDQ
 USAGE
 }
 
@@ -70,6 +72,7 @@ source configs/grpo/experiment_env.sh
 mkdir -p "${GRPO_OUTPUT_ROOT}" "${QAT_OUTPUT_ROOT}"
 echo "Loaded model env: ${LOADED_MODEL_ENV}"
 echo "Runtime config: deepspeed=${DEEPSPEED_CONFIG}, grpo_bs=${GRPO_BATCH_SIZE}, grpo_accum=${GRPO_GRAD_ACCUM}, generations=${GRPO_NUM_GENERATIONS}, max_completion=${GRPO_MAX_COMPLETION_LENGTH}"
+echo "Metis optimization: cache_quantized_weight=${METIS_CACHE_QUANTIZED_WEIGHT}, compile_qdq=${METIS_COMPILE_QDQ}"
 
 model_path_for_key() {
     case "$1" in
@@ -107,6 +110,8 @@ RUN_NAME="${MODEL_KEY}-${METHOD}"
 METIS_WEIGHT_ARGS=(
     --metis_enable_forward_svd "${METIS_WEIGHT_SVD}"
     --metis_forward_svd_rank "${METIS_WEIGHT_SVD_RANK}"
+    --metis_cache_quantized_weight "${METIS_CACHE_QUANTIZED_WEIGHT}"
+    --metis_compile_qdq "${METIS_COMPILE_QDQ}"
 )
 
 case "${METHOD}" in

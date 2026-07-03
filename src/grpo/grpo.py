@@ -69,6 +69,8 @@ class MetisArgs:
         forward_svd_rank: int = 64,
         activation_lowrank_svd: int = 64,
         backward_lowrank_svd: int = 64,
+        cache_quantized_weight: bool = False,
+        compile_qdq: bool = False,
     ):
         self.device = "cuda"
         self.enable_forward_svd = enable_forward_svd
@@ -103,6 +105,8 @@ class MetisArgs:
         self.tp_parts = 4
 
         self.metis_mode = metis_mode  # 可选 "svd" 或 "mean"
+        self.cache_quantized_weight = cache_quantized_weight
+        self.compile_qdq = compile_qdq
 
 def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, compute_dtype=None):
     """
@@ -357,6 +361,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=64,
         metadata={"help": "Metis backward low-rank rank used when backward residual quantization is enabled."}
     )
+    metis_cache_quantized_weight: bool = field(
+        default=False,
+        metadata={"help": "Cache dequantized weights until the parameter version changes."}
+    )
+    metis_compile_qdq: bool = field(
+        default=False,
+        metadata={"help": "Compile the fused NVFP4 quantize-dequantize function with torch.compile."}
+    )
 
     print_args: bool = field(
         default=True,
@@ -583,8 +595,13 @@ def main(script_args, training_args, model_args, dataset_args):
             forward_svd_rank=script_args.metis_forward_svd_rank,
             activation_lowrank_svd=script_args.metis_activation_lowrank_svd,
             backward_lowrank_svd=script_args.metis_backward_lowrank_svd,
+            cache_quantized_weight=script_args.metis_cache_quantized_weight,
+            compile_qdq=script_args.metis_compile_qdq,
         )
         model = replace_model_with_metis(model, metis_args)
+
+    if training_args.gradient_checkpointing and hasattr(model, "config"):
+        model.config.use_cache = False
 
     if hasattr(model, "generation_config") and model.generation_config is not None:
         model.generation_config.use_cache = script_args.generation_use_cache
@@ -593,11 +610,27 @@ def main(script_args, training_args, model_args, dataset_args):
 
     def generate_with_cache(*args, **kwargs):
         kwargs.setdefault("use_cache", script_args.generation_use_cache)
-        return original_generate(*args, **kwargs)
+        was_gradient_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+        if was_gradient_checkpointing:
+            model.gradient_checkpointing_disable()
+        try:
+            return original_generate(*args, **kwargs)
+        finally:
+            if was_gradient_checkpointing:
+                checkpointing_kwargs = training_args.gradient_checkpointing_kwargs
+                if checkpointing_kwargs:
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs=checkpointing_kwargs
+                    )
+                else:
+                    model.gradient_checkpointing_enable()
 
     model.generate = generate_with_cache
     print(f"Rollout generation use_cache={script_args.generation_use_cache}")
-    print(f"Training gradient_checkpointing={training_args.gradient_checkpointing}")
+    print(
+        f"Gradient checkpointing: train={training_args.gradient_checkpointing}, "
+        f"rollout=disabled temporarily; train_use_cache={getattr(model.config, 'use_cache', None)}"
+    )
 
     rollout_wrappers = []
     if script_args.analyze_rollout and len(reward_funcs) > 0 and callable(reward_funcs[0]):

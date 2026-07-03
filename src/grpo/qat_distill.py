@@ -151,6 +151,14 @@ class QATScriptArguments(ScriptArguments):
         default=64,
         metadata={"help": "Metis backward low-rank rank used when backward residual quantization is enabled."}
     )
+    metis_cache_quantized_weight: bool = field(
+        default=False,
+        metadata={"help": "Cache dequantized weights until the parameter version changes."}
+    )
+    metis_compile_qdq: bool = field(
+        default=False,
+        metadata={"help": "Compile the fused NVFP4 quantize-dequantize function with torch.compile."}
+    )
     print_args: bool = field(
         default=True,
         metadata={"help": "是否在训练开始时打印所有参数。"}
@@ -398,6 +406,8 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
             forward_svd_rank=args.metis_forward_svd_rank,
             activation_lowrank_svd=args.metis_activation_lowrank_svd,
             backward_lowrank_svd=args.metis_backward_lowrank_svd,
+            cache_quantized_weight=args.metis_cache_quantized_weight,
+            compile_qdq=args.metis_compile_qdq,
         )
         student_model = replace_model_with_metis(student_model, metis_args)
 
