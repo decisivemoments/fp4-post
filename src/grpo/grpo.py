@@ -388,6 +388,10 @@ class GRPOScriptArguments(ScriptArguments):
         default=False,
         metadata={"help": "Compile the fused NVFP4 quantize-dequantize function with torch.compile."}
     )
+    metis_merge_rollout_weights: bool = field(
+        default=False,
+        metadata={"help": "Merge W-SVD and residual weights into one cached GEMM during rollout only."}
+    )
 
     print_args: bool = field(
         default=True,
@@ -630,11 +634,14 @@ def main(script_args, training_args, model_args, dataset_args):
     def generate_with_cache(*args, **kwargs):
         kwargs.setdefault("use_cache", script_args.generation_use_cache)
         was_gradient_checkpointing = bool(getattr(model, "is_gradient_checkpointing", False))
+        previous_rollout_merge = BitLinear.rollout_merge_active
+        BitLinear.rollout_merge_active = script_args.metis_merge_rollout_weights
         if was_gradient_checkpointing:
             model.gradient_checkpointing_disable()
         try:
             return original_generate(*args, **kwargs)
         finally:
+            BitLinear.rollout_merge_active = previous_rollout_merge
             if was_gradient_checkpointing:
                 checkpointing_kwargs = training_args.gradient_checkpointing_kwargs
                 if checkpointing_kwargs:
@@ -646,6 +653,7 @@ def main(script_args, training_args, model_args, dataset_args):
 
     model.generate = generate_with_cache
     print(f"Rollout generation use_cache={script_args.generation_use_cache}")
+    print(f"Rollout merged W-SVD weight={script_args.metis_merge_rollout_weights}")
     print(
         f"Gradient checkpointing: train={training_args.gradient_checkpointing}, "
         f"rollout=disabled temporarily; train_use_cache={getattr(model.config, 'use_cache', None)}"

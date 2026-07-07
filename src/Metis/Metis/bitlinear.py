@@ -438,6 +438,8 @@ class LinearLowbit(torch.nn.Module):
     pass
 
 class BitLinear(nn.Module):
+    rollout_merge_active = False
+
     def __init__(
         self, 
         in_features, 
@@ -508,6 +510,7 @@ class BitLinear(nn.Module):
         
         self.mean_cache = {}
         self.activation_group = None
+        self._merged_rollout_weight_cache = None
         self.layer_name = ""  # 由 convert_to_metis 赋值
 
     def _get_shared_quantized_input(self, x: torch.Tensor) -> torch.Tensor:
@@ -537,6 +540,38 @@ class BitLinear(nn.Module):
         group["input_ref"] = weakref.ref(x, clear_cached_input)
         group["quantized_input"] = quantized_input
         return quantized_input
+
+    @torch.no_grad()
+    def _get_merged_rollout_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        cache_key = (
+            self.vlinear.weight._version,
+            self.ulinear.weight._version,
+            self.s._version,
+            self.warmup_linear.weight._version,
+            self.vlinear.weight.device,
+            dtype,
+            LinearLowbitFunction.q_forward_weight,
+            LinearLowbitFunction.enable_nv_recipe,
+        )
+        if self._merged_rollout_weight_cache is not None:
+            cached_key, cached_weight = self._merged_rollout_weight_cache
+            if cached_key == cache_key:
+                return cached_weight
+
+        v_weight = self.vlinear._get_quantized_weight(self.vlinear.weight.to(dtype))
+        residual_weight = self.warmup_linear._get_quantized_weight(
+            self.warmup_linear.weight.to(dtype)
+        )
+        u_weight = self.ulinear.weight.to(dtype)
+        singular_values = self.s.to(dtype)
+        merged_weight = (u_weight * singular_values.unsqueeze(0)) @ v_weight
+        merged_weight = merged_weight + residual_weight
+        self._merged_rollout_weight_cache = (cache_key, merged_weight)
+        return merged_weight
+
+    def _apply(self, fn, recurse=True):
+        self._merged_rollout_weight_cache = None
+        return super()._apply(fn, recurse=recurse)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         LinearLowbitFunction.mean_cache = self.mean_cache
@@ -548,6 +583,12 @@ class BitLinear(nn.Module):
             )
             if share_activation:
                 shared_input = self._get_shared_quantized_input(x)
+                if BitLinear.rollout_merge_active and not torch.is_grad_enabled():
+                    merged_weight = self._get_merged_rollout_weight(shared_input.dtype)
+                    y = torch.matmul(shared_input, merged_weight.T)
+                    if self.warmup_linear.bias is not None:
+                        y = y + self.warmup_linear.bias.to(y.dtype)
+                    return y
                 y = self.vlinear(x, quantized_input=shared_input)
             else:
                 LinearLowbitFunction.mean_cache_key = f"{self.layer_name}.vlinear"

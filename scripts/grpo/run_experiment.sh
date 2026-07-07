@@ -46,6 +46,7 @@ Useful overrides:
   METIS_WEIGHT_SVD=true METIS_WEIGHT_SVD_RANK=64 METIS_ACTIVATION_GRAD_RANK=64
   METIS_CACHE_QUANTIZED_WEIGHT=true  # uses extra GPU memory
   METIS_COMPILE_QDQ=true             # compile fused NVFP4 QDQ
+  METIS_MERGE_ROLLOUT_WEIGHTS=true   # rollout-only merged W-SVD GEMM
 USAGE
 }
 
@@ -262,6 +263,7 @@ elif [[ "${STAGE}" == "grpo" ]]; then
         --bf16 true \
         --gradient_checkpointing "${GRPO_GRADIENT_CHECKPOINTING}" \
         --generation_use_cache "${GRPO_GENERATION_USE_CACHE}" \
+        --metis_merge_rollout_weights "${METIS_MERGE_ROLLOUT_WEIGHTS}" \
         --analyze_rollout "${ANALYZE_ROLLOUT}" \
         --resume_from_checkpoint "${GRPO_RESUME}" \
         --use_custom_analysis "${USE_CUSTOM_ANALYSIS}" \

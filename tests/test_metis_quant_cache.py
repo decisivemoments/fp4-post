@@ -204,3 +204,53 @@ def test_projection_group_reuses_quantized_activation():
     assert x.grad is not None
     assert q_proj.vlinear.weight.grad is not None
     assert k_proj.vlinear.weight.grad is not None
+
+
+def test_rollout_merged_weight_cache_reuses_and_invalidates():
+    args = SimpleNamespace(
+        device="cpu",
+        cache_quantized_weight=True,
+        forward_svd_rank=4,
+    )
+    layer = BitLinear.__new__(BitLinear)
+    torch.nn.Module.__init__(layer)
+    layer.args = args
+    layer.is_svd_quant = True
+    layer.mean_cache = {}
+    layer.activation_group = None
+    layer._merged_rollout_weight_cache = None
+    layer.layer_name = "test.layer"
+    layer.vlinear = LinearLowbit(16, 4, bias=False, args=args)
+    layer.ulinear = torch.nn.Linear(4, 8, bias=False)
+    layer.warmup_linear = LinearLowbit(16, 8, bias=True, args=args)
+    layer.s = torch.nn.Parameter(torch.ones(4))
+
+    LinearLowbitFunction.compute_dtype = torch.float32
+    LinearLowbitFunction.q_forward_input = Cast2Fp32
+    LinearLowbitFunction.q_forward_weight = Cast2Fp32
+    LinearLowbitFunction.enable_activation_svd = True
+    LinearLowbitFunction.activation_lowrank_svd = 4
+    LinearLowbitFunction.activation_lowrank_niter = 0
+    LinearLowbitFunction.activation_broadcast_dim = -1
+    LinearLowbitFunction.tp_simulate = False
+    LinearLowbitFunction.tp_parts = 1
+    LinearLowbitFunction.metis_mode = "mean"
+    LinearLowbitFunction.enable_nv_recipe = False
+
+    x = torch.randn(2, 3, 16)
+    try:
+        with torch.no_grad():
+            BitLinear.rollout_merge_active = False
+            expected = layer(x)
+            BitLinear.rollout_merge_active = True
+            actual = layer(x)
+            first_weight = layer._get_merged_rollout_weight(torch.float32)
+            second_weight = layer._get_merged_rollout_weight(torch.float32)
+            layer.s.add_(0.1)
+            updated_weight = layer._get_merged_rollout_weight(torch.float32)
+    finally:
+        BitLinear.rollout_merge_active = False
+
+    torch.testing.assert_close(actual, expected)
+    assert first_weight is second_weight
+    assert updated_weight is not first_weight
