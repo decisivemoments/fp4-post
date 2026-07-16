@@ -32,6 +32,7 @@ import torch
 from accelerate import logging
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, GenerationConfig
+from transformers.trainer_utils import get_last_checkpoint
 from trl import (
     DatasetMixtureConfig,
     GRPOConfig,
@@ -709,11 +710,13 @@ def main(script_args, training_args, model_args, dataset_args):
         capture.register_hooks(trainer.model, target_layers)
 
     # Train the model
-    if training_args.resume_from_checkpoint is not None and training_args.resume_from_checkpoint.lower() == "true":
-        training_args.resume_from_checkpoint = True
-    elif training_args.resume_from_checkpoint is not None and training_args.resume_from_checkpoint.lower() == "false":
-        training_args.resume_from_checkpoint = False
-    trainer.train(resume_from_checkpoint = training_args.resume_from_checkpoint)
+    resume_checkpoint = resolve_grpo_resume_checkpoint(
+        training_args.resume_from_checkpoint,
+        training_args.output_dir,
+    )
+    if resume_checkpoint:
+        print_resume_checkpoint_diagnostics(resume_checkpoint)
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
 
     # Log training complete
     trainer.accelerator.print("✅ Training completed.")
@@ -763,6 +766,68 @@ def print_and_save_args(args, name, output_dir=None):
             json.dump(args_dict, f, indent=2, ensure_ascii=False)
         print(f"💾 Saved to: {output_path}")
 
+
+def resolve_grpo_resume_checkpoint(resume_from_checkpoint, output_dir: str):
+    if resume_from_checkpoint is None:
+        return None
+
+    if isinstance(resume_from_checkpoint, bool):
+        if not resume_from_checkpoint:
+            return False
+        checkpoint = get_last_checkpoint(output_dir)
+        if checkpoint is None:
+            raise FileNotFoundError(f"No checkpoint-* directory found in output_dir={output_dir}")
+        return checkpoint
+
+    value = str(resume_from_checkpoint).strip()
+    if value == "" or value.lower() in {"false", "none", "null"}:
+        return False
+    if value.lower() in {"true", "latest"}:
+        checkpoint = get_last_checkpoint(output_dir)
+        if checkpoint is None:
+            raise FileNotFoundError(f"No checkpoint-* directory found in output_dir={output_dir}")
+        return checkpoint
+
+    path = Path(value)
+    if not path.is_absolute() and not path.exists():
+        path = Path(output_dir) / value
+    if not path.exists():
+        raise FileNotFoundError(f"GRPO resume checkpoint not found: {path}")
+    return str(path)
+
+
+def print_resume_checkpoint_diagnostics(checkpoint: str):
+    path = Path(checkpoint)
+    trainer_state_path = path / "trainer_state.json"
+    expected = [
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+    ]
+    present = [name for name in expected if (path / name).exists()]
+    missing = [name for name in expected if name not in present]
+    deepspeed_state_dirs = sorted(p.name for p in path.glob("global_step*") if p.is_dir())
+    print(f"🔁 Resolved GRPO resume checkpoint: {path}")
+    print(f"🔁 Resume files present: {present}")
+    if trainer_state_path.exists():
+        with trainer_state_path.open() as f:
+            trainer_state = json.load(f)
+        print(
+            "🔁 trainer_state: "
+            f"global_step={trainer_state.get('global_step')}, "
+            f"epoch={trainer_state.get('epoch')}, "
+            f"max_steps={trainer_state.get('max_steps')}"
+        )
+    if deepspeed_state_dirs:
+        print(f"🔁 DeepSpeed state dirs: {deepspeed_state_dirs[:3]}")
+    if missing:
+        print(
+            "⚠️ Resume checkpoint is missing standard Trainer state files: "
+            f"{missing}. If this is a DeepSpeed checkpoint, optimizer/scheduler "
+            "state may be stored under global_step* instead."
+        )
+
 if __name__ == "__main__":
     parser = make_parser()
     # When using the trl cli, this script may be run with additional arguments, corresponding accelerate arguments.
@@ -772,7 +837,6 @@ if __name__ == "__main__":
         return_remaining_strings=True
     )
     output_dir = getattr(training_args, 'output_dir', 'outputs/grpo/Qwen2_5-0.5B-grpo')
-    training_args.set_save(strategy="steps", steps=1000)
     
     if script_args.print_args:
         print_and_save_args(script_args, "Script Arguments", output_dir)

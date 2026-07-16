@@ -37,6 +37,7 @@ Useful overrides:
   DATA_ROOT=... MODEL_ROOT=...
   GRPO_OUTPUT_ROOT=outputs/grpo QAT_OUTPUT_ROOT=outputs/qat
   GRPO_MAX_STEPS=2000 QAT_MAX_STEPS=1000 CUDA_VISIBLE_DEVICES=0,1,2,3
+  QAT_RESUME_FROM_CHECKPOINT=latest  # or checkpoint-500 / /path/to/checkpoint-500
   QAT_CHECKPOINT=final              # or checkpoint-1000 / 1000
   QAT_SOURCE=/path/to/merged/model  # overrides QAT_CHECKPOINT for grpo qat_fp4/full
   MODEL_ENV_FILE=configs/grpo/model_env/qwen2_0_5b.sh
@@ -127,7 +128,10 @@ case "${METHOD}" in
         METIS_ARGS=(
             --use_metis true
             --metis_mode mean
-            "${METIS_WEIGHT_ARGS[@]}"
+            --metis_enable_forward_svd false
+            --metis_forward_svd_rank 0
+            --metis_cache_quantized_weight "${METIS_CACHE_QUANTIZED_WEIGHT}"
+            --metis_compile_qdq "${METIS_COMPILE_QDQ}"
             --metis_enable_activation_svd false
             --metis_enable_backward_svd false
             --metis_activation_lowrank_svd 0
@@ -203,6 +207,9 @@ if [[ "${STAGE}" == "qat" ]]; then
     if [[ -n "${QAT_MAX_STEPS:-}" ]]; then
         EXTRA_ARGS+=(--max_steps "${QAT_MAX_STEPS}")
     fi
+    if [[ "${QAT_RESUME_FROM_CHECKPOINT}" != "false" && -n "${QAT_RESUME_FROM_CHECKPOINT}" ]]; then
+        EXTRA_ARGS+=(--resume_from_checkpoint "${QAT_RESUME_FROM_CHECKPOINT}")
+    fi
 
     echo "Running QAT: method=${METHOD} model=${BASE_MODEL_PATH} output=${OUT_DIR}"
     accelerate launch --config_file "${ACCELERATE_DS_CONFIG}" src/grpo/qat_distill.py \
@@ -259,6 +266,8 @@ elif [[ "${STAGE}" == "grpo" ]]; then
         --logging_dir "${TB_DIR}" \
         --reward_funcs "${REWARD_FUNCS}" \
         --eval_strategy "${GRPO_EVAL_STRATEGY}" \
+        --save_strategy steps \
+        --save_steps "${GRPO_SAVE_STEPS}" \
         --deepspeed "${DEEPSPEED_CONFIG}" \
         --bf16 true \
         --gradient_checkpointing "${GRPO_GRADIENT_CHECKPOINTING}" \

@@ -6,6 +6,7 @@ import os
 import sys
 import json
 import copy
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -117,6 +118,15 @@ class QATScriptArguments(ScriptArguments):
         default=10,
         metadata={"help": "每隔多少步打印一次 loss。"}
     )
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "QAT checkpoint to resume from. Use a checkpoint path, checkpoint-N, "
+                "`latest`, `true`, or leave empty to start fresh."
+            )
+        },
+    )
 
     # ── Metis ─────────────────────────────────
     use_metis: bool = field(
@@ -224,6 +234,121 @@ class QATCollator:
             "input_ids":      encoded["input_ids"],       # (B, S_p)
             "attention_mask": encoded["attention_mask"],  # (B, S_p)
         }
+
+
+QAT_RESUME_STATE_NAME = "qat_resume_state.json"
+ACCELERATOR_STATE_DIRNAME = "accelerator_state"
+
+
+def _checkpoint_step(path: str | os.PathLike) -> int:
+    match = re.search(r"checkpoint-(\d+)$", str(path).rstrip("/"))
+    return int(match.group(1)) if match else -1
+
+
+def resolve_qat_resume_checkpoint(resume_from_checkpoint: Optional[str], output_dir: str) -> Optional[str]:
+    if resume_from_checkpoint is None:
+        return None
+
+    value = str(resume_from_checkpoint).strip()
+    if value == "" or value.lower() in {"false", "none", "null"}:
+        return None
+
+    if value.lower() in {"true", "latest"}:
+        candidates = [
+            p for p in Path(output_dir).glob("checkpoint-*")
+            if p.is_dir() and _checkpoint_step(p) >= 0
+        ]
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoint-* directories found under {output_dir}")
+        return str(max(candidates, key=_checkpoint_step))
+
+    path = Path(value)
+    if not path.is_absolute() and not path.exists():
+        path = Path(output_dir) / value
+    if not path.exists():
+        raise FileNotFoundError(f"QAT resume checkpoint not found: {path}")
+    return str(path)
+
+
+def load_qat_model_weights(model: torch.nn.Module, checkpoint_dir: str, accelerator: Accelerator):
+    checkpoint = Path(checkpoint_dir)
+    safetensor_index = checkpoint / "model.safetensors.index.json"
+    bin_index = checkpoint / "pytorch_model.bin.index.json"
+    single_safetensor = checkpoint / "model.safetensors"
+    single_bin = checkpoint / "pytorch_model.bin"
+
+    def load_weight_file(path: Path):
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+            return load_file(str(path), device="cpu")
+        return torch.load(str(path), map_location="cpu")
+
+    if safetensor_index.exists() or bin_index.exists():
+        index_path = safetensor_index if safetensor_index.exists() else bin_index
+        with index_path.open() as f:
+            weight_map = json.load(f)["weight_map"]
+        for shard_name in sorted(set(weight_map.values())):
+            state_dict = load_weight_file(checkpoint / shard_name)
+            incompatible = model.load_state_dict(state_dict, strict=False)
+            if incompatible.unexpected_keys and accelerator.is_main_process:
+                accelerator.print(
+                    f"⚠️ Unexpected keys while loading {shard_name}: "
+                    f"{len(incompatible.unexpected_keys)}"
+                )
+            del state_dict
+        return
+
+    if single_safetensor.exists():
+        state_dict = load_weight_file(single_safetensor)
+    elif single_bin.exists():
+        state_dict = load_weight_file(single_bin)
+    else:
+        raise FileNotFoundError(
+            f"No model.safetensors/pytorch_model.bin checkpoint weights found in {checkpoint_dir}"
+        )
+
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    if accelerator.is_main_process and (incompatible.missing_keys or incompatible.unexpected_keys):
+        accelerator.print(
+            "⚠️ Loaded model-only QAT checkpoint with "
+            f"{len(incompatible.missing_keys)} missing and "
+            f"{len(incompatible.unexpected_keys)} unexpected keys."
+        )
+
+
+def save_qat_checkpoint(
+    accelerator: Accelerator,
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    save_path: str,
+    global_step: int,
+    epoch: int,
+    next_batch_in_epoch: int,
+):
+    accelerator.print(f"💾 Saving checkpoint to {save_path}")
+    unwrapped = accelerator.unwrap_model(model)
+    unwrapped.save_pretrained(
+        save_path,
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+    )
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(save_path)
+
+    accelerator.wait_for_everyone()
+    accelerator.save_state(os.path.join(save_path, ACCELERATOR_STATE_DIRNAME))
+    if accelerator.is_main_process:
+        with open(os.path.join(save_path, QAT_RESUME_STATE_NAME), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "global_step": global_step,
+                    "epoch": epoch,
+                    "next_batch_in_epoch": next_batch_in_epoch,
+                },
+                f,
+                indent=2,
+            )
+    accelerator.wait_for_everyone()
 
 
 # ─────────────────────────────────────────────
@@ -361,6 +486,20 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    resume_checkpoint = resolve_qat_resume_checkpoint(args.resume_from_checkpoint, args.output_dir)
+    resume_has_accelerator_state = False
+    resume_state = {}
+    if resume_checkpoint is not None:
+        resume_state_path = os.path.join(resume_checkpoint, QAT_RESUME_STATE_NAME)
+        accelerator_state_path = os.path.join(resume_checkpoint, ACCELERATOR_STATE_DIRNAME)
+        resume_has_accelerator_state = os.path.isdir(accelerator_state_path)
+        if os.path.exists(resume_state_path):
+            with open(resume_state_path, encoding="utf-8") as f:
+                resume_state = json.load(f)
+        accelerator.print(
+            f"🔁 Resuming QAT from {resume_checkpoint} "
+            f"({'full accelerator state' if resume_has_accelerator_state else 'model weights only'})"
+        )
 
     if args.print_args and accelerator.is_main_process:
         print_and_save_args(args, "QAT Script Arguments", args.output_dir)
@@ -410,6 +549,13 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
             compile_qdq=args.metis_compile_qdq,
         )
         student_model = replace_model_with_metis(student_model, metis_args)
+
+    if resume_checkpoint is not None and not resume_has_accelerator_state:
+        accelerator.print(
+            "⚠️ This checkpoint has no accelerator_state; loading model weights only. "
+            "Optimizer, scheduler, dataloader position, and RNG state will not be exactly restored."
+        )
+        load_qat_model_weights(student_model, resume_checkpoint, accelerator)
 
     student_model.gradient_checkpointing_enable()
     
@@ -476,13 +622,33 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
         student_model, optimizer, train_dataloader, scheduler
     )
 
+    global_step = 0
+    start_epoch = 0
+    skip_batches_in_epoch = 0
+    if resume_checkpoint is not None and resume_has_accelerator_state:
+        accelerator.load_state(os.path.join(resume_checkpoint, ACCELERATOR_STATE_DIRNAME))
+        global_step = int(resume_state.get("global_step", _checkpoint_step(resume_checkpoint)))
+        start_epoch = int(resume_state.get("epoch", 0))
+        skip_batches_in_epoch = int(resume_state.get("next_batch_in_epoch", 0))
+        accelerator.print(
+            f"🔁 Restored full QAT state: global_step={global_step}, "
+            f"epoch={start_epoch}, skip_batches={skip_batches_in_epoch}"
+        )
+    elif resume_checkpoint is not None:
+        global_step = max(0, _checkpoint_step(resume_checkpoint))
+        for _ in range(global_step):
+            scheduler.step()
+        accelerator.print(
+            f"🔁 Continuing from model weights at global_step={global_step}; "
+            "optimizer history is fresh."
+        )
+
     # ── 训练循环 ──────────────────────────────
     accelerator.print(f"🚀 Starting QAT distillation — total steps: {total_steps}")
 
-    global_step = 0
     running_loss = 0.0
 
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(start_epoch, args.num_train_epochs):
         student_model.train()
 
         pbar = tqdm(
@@ -494,6 +660,9 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
         top_k = args.kl_top_k if hasattr(args, 'kl_top_k') else -1  # 从配置读取，默认 -1（全量）
 
         for step, batch in enumerate(pbar):
+            if epoch == start_epoch and step < skip_batches_in_epoch:
+                continue
+
             if args.max_steps and args.max_steps > 0 and global_step >= args.max_steps:
                 break
 
@@ -577,7 +746,6 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
             # ── 日志 & 保存 ───────────────────────
             running_loss += loss.detach().item()
             if writer is not None:
-                global_step = step + epoch * len(train_dataloader)
                 writer.add_scalar('train/loss', loss.item(), global_step)
                 writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], global_step)
 
@@ -600,15 +768,17 @@ def main(args: QATScriptArguments, model_args: ModelConfig, dataset_args: Datase
 
                 if global_step % args.save_steps == 0:
                     save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    accelerator.print(f"💾 Saving checkpoint to {save_path}")
-                    unwrapped = accelerator.unwrap_model(student_model)
-                    unwrapped.save_pretrained(
-                        save_path,
-                        is_main_process=accelerator.is_main_process,
-                        save_function=accelerator.save,
+                    save_qat_checkpoint(
+                        accelerator=accelerator,
+                        model=student_model,
+                        tokenizer=tokenizer,
+                        save_path=save_path,
+                        global_step=global_step,
+                        epoch=epoch,
+                        next_batch_in_epoch=step + 1,
                     )
-                    if accelerator.is_main_process:
-                        tokenizer.save_pretrained(save_path)
+
+        skip_batches_in_epoch = 0
 
         if args.max_steps and args.max_steps > 0 and global_step >= args.max_steps:
             break
