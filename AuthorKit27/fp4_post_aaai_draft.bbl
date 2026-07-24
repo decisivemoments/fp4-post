@@ -1,0 +1,139 @@
+\begin{thebibliography}{27}
+\providecommand{\natexlab}[1]{#1}
+
+\bibitem[{Ashkboos et~al.(2024)Ashkboos, Mohtashami, Croci, Li, Cameron, Jaggi, Alistarh, Hoefler, and Hensman}]{ashkboos2024quarot}
+Ashkboos, S.; Mohtashami, A.; Croci, M.~L.; Li, B.; Cameron, P.; Jaggi, M.; Alistarh, D.; Hoefler, T.; and Hensman, J. 2024.
+\newblock {QuaRot}: Outlier-Free 4-Bit Inference in Rotated {LLMs}.
+\newblock arXiv:2404.00456.
+
+\bibitem[{Cao et~al.(2025)Cao, Chen, Yang, Huang, Dong, Zhou, Chen, Dong, Wang, Hou, Cheng, Wu, Yang, Lu, Gu, and Shang}]{cao2025metis}
+Cao, H.; Chen, M.; Yang, Y.; Huang, R.; Dong, F.; Zhou, J.; Chen, A.; Dong, M.; Wang, Y.; Hou, J.; Cheng, Y.; Wu, F.; Yang, F.; Lu, T.; Gu, N.; and Shang, L. 2025.
+\newblock Metis: Training LLMs with FP4 Quantization.
+\newblock arXiv:2509.00404.
+
+\bibitem[{Cao et~al.(2026)Cao, Huang, Chen, Yang, Dong, Chen, Huang, Zhang, Dong, Wang, Hou, Lv, Dick, Cheng, Lu, Yang, Chen, and Shang}]{cao2026averis}
+Cao, H.; Huang, Z.; Chen, M.; Yang, Y.; Dong, F.; Chen, A.; Huang, R.; Zhang, X.; Dong, M.; Wang, Y.; Hou, J.; Lv, Q.; Dick, R.~P.; Cheng, Y.; Lu, T.; Yang, F.; Chen, Y.; and Shang, L. 2026.
+\newblock The Curse and Blessing of Mean Bias in FP4-Quantized LLM Training.
+\newblock arXiv:2603.10444.
+
+\bibitem[{Chmiel et~al.(2025)Chmiel, Fishman, Banner, and Soudry}]{chmiel2025fp4}
+Chmiel, B.; Fishman, M.; Banner, R.; and Soudry, D. 2025.
+\newblock {FP4} All the Way: Fully Quantized Training of {LLMs}.
+\newblock arXiv:2505.19115.
+
+\bibitem[{Clark et~al.(2018)Clark, Cowhey, Etzioni, Khot, Sabharwal, Schoenick, and Tafjord}]{clark2018arc}
+Clark, P.; Cowhey, I.; Etzioni, O.; Khot, T.; Sabharwal, A.; Schoenick, C.; and Tafjord, O. 2018.
+\newblock Think you have Solved Question Answering? Try {ARC}, the {AI2} Reasoning Challenge.
+\newblock arXiv:1803.05457.
+
+\bibitem[{Dettmers et~al.(2022)Dettmers, Lewis, Belkada, and Zettlemoyer}]{dettmers2022llmint8}
+Dettmers, T.; Lewis, M.; Belkada, Y.; and Zettlemoyer, L. 2022.
+\newblock {LLM.int8()}: 8-Bit Matrix Multiplication for Transformers at Scale.
+\newblock arXiv:2208.07339.
+
+\bibitem[{Du et~al.(2024)Du, Zhang, Cao, Guo, Cao, Chu, and Xu}]{du2024bitdistiller}
+Du, D.; Zhang, Y.; Cao, S.; Guo, J.; Cao, T.; Chu, X.; and Xu, N. 2024.
+\newblock {BitDistiller}: Unleashing the Potential of Sub-4-Bit {LLMs} via Self-Distillation.
+\newblock arXiv:2402.10631.
+
+\bibitem[{Esser et~al.(2020)Esser, McKinstry, Bablani, Appuswamy, and Modha}]{esser2020lsq}
+Esser, S.~K.; McKinstry, J.; Bablani, D.; Appuswamy, R.; and Modha, D.~S. 2020.
+\newblock Learned Step Size Quantization.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{Frantar et~al.(2023)Frantar, Ashkboos, Hoefler, and Alistarh}]{frantar2023gptq}
+Frantar, E.; Ashkboos, S.; Hoefler, T.; and Alistarh, D. 2023.
+\newblock {GPTQ}: Accurate Post-Training Quantization for Generative Pre-trained Transformers.
+\newblock In \emph{International Conference on Learning Representations}.
+
+\bibitem[{He et~al.(2025)He, Liang, Xu, Liu, Chen, Wang, Song, Yu, Liang, Wang, Zhang, Wang, Tu, Mi, and Yu}]{he2025deepmath}
+He, Z.; Liang, T.; Xu, J.; Liu, Q.; Chen, X.; Wang, Y.; Song, L.; Yu, D.; Liang, Z.; Wang, W.; Zhang, Z.; Wang, R.; Tu, Z.; Mi, H.; and Yu, D. 2025.
+\newblock DeepMath-103K: A Large-Scale, Challenging, Decontaminated, and Verifiable Mathematical Dataset for Advancing Reasoning.
+\newblock arXiv:2504.11456.
+
+\bibitem[{Hinton, Vinyals, and Dean(2015)}]{hinton2015distilling}
+Hinton, G.; Vinyals, O.; and Dean, J. 2015.
+\newblock Distilling the Knowledge in a Neural Network.
+\newblock arXiv:1503.02531.
+
+\bibitem[{Huang et~al.(2025)Huang, Ge, Yang, Xiao, Mao, Lin, Ye, Liu, Cheung, Yin, Lu, Qi, Han, and Chen}]{huang2025qerl}
+Huang, W.; Ge, Y.; Yang, S.; Xiao, Y.; Mao, H.; Lin, Y.; Ye, H.; Liu, S.; Cheung, K.~C.; Yin, H.; Lu, Y.; Qi, X.; Han, S.; and Chen, Y. 2025.
+\newblock {QeRL}: Beyond Efficiency -- Quantization-enhanced Reinforcement Learning for {LLMs}.
+\newblock arXiv:2510.11696.
+
+\bibitem[{Lee, Choi, and Chang(2025)}]{lee2025qrazor}
+Lee, D.; Choi, S.; and Chang, I.~J. 2025.
+\newblock {QRazor}: Reliable and Effortless 4-bit {LLM} Quantization by Significant Data Razoring.
+\newblock arXiv:2501.13331.
+
+\bibitem[{Lightman et~al.(2023)Lightman, Kosaraju, Burda, Edwards, Baker, Lee, Leike, Schulman, Sutskever, and Cobbe}]{lightman2023letsverify}
+Lightman, H.; Kosaraju, V.; Burda, Y.; Edwards, H.; Baker, B.; Lee, T.; Leike, J.; Schulman, J.; Sutskever, I.; and Cobbe, K. 2023.
+\newblock Let's Verify Step by Step.
+\newblock arXiv:2305.20050.
+
+\bibitem[{Lin et~al.(2024)Lin, Tang, Tang, Yang, Dang, and Han}]{lin2024awq}
+Lin, J.; Tang, J.; Tang, H.; Yang, S.; Dang, X.; and Han, S. 2024.
+\newblock {AWQ}: Activation-aware Weight Quantization for {LLM} Compression and Acceleration.
+\newblock In \emph{Proceedings of Machine Learning and Systems}.
+
+\bibitem[{Liu et~al.(2023)Liu, Liu, Huang, Dong, and Cheng}]{liu2023llmfp4}
+Liu, S.-y.; Liu, Z.; Huang, X.; Dong, P.; and Cheng, K.-T. 2023.
+\newblock {LLM-FP4}: 4-Bit Floating-Point Quantized Transformers.
+\newblock arXiv:2310.16836.
+
+\bibitem[{{NVIDIA} et~al.(2025){NVIDIA}, Abecassis, Agrusa et~al.}]{nvidia2025nvfp4}
+{NVIDIA}; Abecassis, F.; Agrusa, A.; et~al. 2025.
+\newblock Pretraining Large Language Models with {NVFP4}.
+\newblock arXiv:2509.25149.
+
+\bibitem[{Rein et~al.(2023)Rein, Hou, Stickland, Petty, Pang, Dirani, Michael, and Bowman}]{rein2023gpqa}
+Rein, D.; Hou, B.~L.; Stickland, A.~C.; Petty, J.; Pang, R.~Y.; Dirani, J.; Michael, J.; and Bowman, S.~R. 2023.
+\newblock {GPQA}: A Graduate-Level Google-Proof {Q\&A} Benchmark.
+\newblock arXiv:2311.12022.
+
+\bibitem[{Schulman et~al.(2017)Schulman, Wolski, Dhariwal, Radford, and Klimov}]{schulman2017ppo}
+Schulman, J.; Wolski, F.; Dhariwal, P.; Radford, A.; and Klimov, O. 2017.
+\newblock Proximal Policy Optimization Algorithms.
+\newblock arXiv:1707.06347.
+
+\bibitem[{Shao et~al.(2024{\natexlab{a}})Shao, Chen, Zhang, Xu, Zhao, Li, Zhang, Gao, Qiao, and Luo}]{shao2024omniquant}
+Shao, W.; Chen, M.; Zhang, Z.; Xu, P.; Zhao, L.; Li, Z.; Zhang, K.; Gao, P.; Qiao, Y.; and Luo, P. 2024{\natexlab{a}}.
+\newblock OmniQuant: Omnidirectionally Calibrated Quantization for Large Language Models.
+\newblock arXiv:2308.13137.
+
+\bibitem[{Shao et~al.(2024{\natexlab{b}})Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu, and Guo}]{shao2024deepseekmath}
+Shao, Z.; Wang, P.; Zhu, Q.; Xu, R.; Song, J.; Bi, X.; Zhang, H.; Zhang, M.; Li, Y.~K.; Wu, Y.; and Guo, D. 2024{\natexlab{b}}.
+\newblock DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models.
+\newblock arXiv:2402.03300.
+
+\bibitem[{Sun et~al.(2024)Sun, Liu, Bai, Bao, Zhao, Li, Hu, Yu, Hou, Yuan, Jiang, Liu, and Yao}]{sun2024flatquant}
+Sun, Y.; Liu, R.; Bai, H.; Bao, H.; Zhao, K.; Li, Y.; Hu, J.; Yu, X.; Hou, L.; Yuan, C.; Jiang, X.; Liu, W.; and Yao, J. 2024.
+\newblock {FlatQuant}: Flatness Matters for {LLM} Quantization.
+\newblock arXiv:2410.09426.
+
+\bibitem[{Wang et~al.(2025)Wang, Gong, Liu, Zhao, Yang, Guo, Zha, and Cheng}]{wang2025optimizing}
+Wang, R.; Gong, Y.; Liu, X.; Zhao, G.; Yang, Z.; Guo, B.; Zha, Z.; and Cheng, P. 2025.
+\newblock Optimizing Large Language Model Training Using {FP4} Quantization.
+\newblock In \emph{Proceedings of the 42nd International Conference on Machine Learning}.
+
+\bibitem[{Xiao et~al.(2023)Xiao, Lin, Seznec, Wu, Demouth, and Han}]{xiao2023smoothquant}
+Xiao, G.; Lin, J.; Seznec, M.; Wu, H.; Demouth, J.; and Han, S. 2023.
+\newblock SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models.
+\newblock arXiv:2211.10438.
+
+\bibitem[{Xin et~al.(2026)Xin, Priyadarshi, Xin, Kartal, Vavre, Thekkumpate, Chen, Mahabaleshwarkar, Shahaf, Bercovich, Patel, Velury, Luo, Cheng, Chen, Yu, Ping, Rybakov, Tajbakhsh, Olabiyi, Stosic, Wu, Han, Chung, Sreenivas, Catanzaro, Suhara, Blankevoort, and Mao}]{xin2026qad}
+Xin, M.; Priyadarshi, S.; Xin, J.; Kartal, B.; Vavre, A.; Thekkumpate, A.~K.; Chen, Z.; Mahabaleshwarkar, A.~S.; Shahaf, I.; Bercovich, A.; Patel, K.; Velury, S.~V.; Luo, C.; Cheng, Z.; Chen, J.; Yu, C.-H.; Ping, W.; Rybakov, O.; Tajbakhsh, N.; Olabiyi, O.; Stosic, D.; Wu, D.; Han, S.; Chung, E.; Sreenivas, S.~T.; Catanzaro, B.; Suhara, Y.; Blankevoort, T.; and Mao, H. 2026.
+\newblock Quantization-Aware Distillation for {NVFP4} Inference Accuracy Recovery.
+\newblock arXiv:2601.20088.
+
+\bibitem[{Yang et~al.(2024{\natexlab{a}})Yang, Yang, Zhang, Hui, Zheng, Yu, Li, Liu, Huang, Wei, Lin et~al.}]{yang2024qwen25}
+Yang, A.; Yang, B.; Zhang, B.; Hui, B.; Zheng, B.; Yu, B.; Li, C.; Liu, D.; Huang, F.; Wei, H.; Lin, H.; et~al. 2024{\natexlab{a}}.
+\newblock Qwen2.5 Technical Report.
+\newblock arXiv:2412.15115.
+
+\bibitem[{Yang et~al.(2024{\natexlab{b}})Yang, Zhang, Hui, Gao, Yu, Li, Liu, Tu, Zhou, Lin, Lu, Xue, Lin, Liu, Ren, and Zhang}]{yang2024qwen25math}
+Yang, A.; Zhang, B.; Hui, B.; Gao, B.; Yu, B.; Li, C.; Liu, D.; Tu, J.; Zhou, J.; Lin, J.; Lu, K.; Xue, M.; Lin, R.; Liu, T.; Ren, X.; and Zhang, Z. 2024{\natexlab{b}}.
+\newblock Qwen2.5-Math Technical Report: Toward Mathematical Expert Model via Self-Improvement.
+\newblock arXiv:2409.12122.
+
+\end{thebibliography}

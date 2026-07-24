@@ -7,7 +7,10 @@ from functools import partial
 import weakref
 
 import math
-# from scipy.linalg import hadamard
+
+
+def _largest_power_of_two_at_most(value: int) -> int:
+    return 1 << (int(value).bit_length() - 1)
 
 # -----------------------------------------------------------------------------
 # Core autograd.Function implementing low-bit GEMM with optional Spectral Decomposition
@@ -30,6 +33,7 @@ class LinearLowbitFunction(torch.autograd.Function):
     q_backward_outputgrad = Cast2Fp4e2m1
     
     enable_nv_recipe = False
+    _hadamard_cache = {}
 
     # Low-rank iteration counts for randomized SVD
     activation_lowrank_niter = 0
@@ -53,6 +57,50 @@ class LinearLowbitFunction(torch.autograd.Function):
     metis_mode = "mean"  # 可选 "svd" 或 "mean"
     mean_cache = None
     mean_cache_key = "default"
+
+    @staticmethod
+    def _get_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        cache_key = (int(size), device, dtype)
+        cached = LinearLowbitFunction._hadamard_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if size <= 0 or (size & (size - 1)) != 0:
+            raise ValueError(f"Hadamard block size must be a power of two, got {size}")
+
+        h = torch.ones((1, 1), device=device, dtype=dtype)
+        while h.shape[0] < size:
+            h = torch.cat(
+                (
+                    torch.cat((h, h), dim=1),
+                    torch.cat((h, -h), dim=1),
+                ),
+                dim=0,
+            )
+        LinearLowbitFunction._hadamard_cache[cache_key] = h
+        return h
+
+    @staticmethod
+    def _apply_hadamard_blocks(value: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        dim = value.shape[-1]
+        if dim <= 1:
+            return value
+
+        outputs = []
+        offset = 0
+        hadamard_dtype = torch.float32 if value.dtype in (torch.float16, torch.bfloat16) else value.dtype
+        work_value = value.to(hadamard_dtype)
+        while offset < dim:
+            block_size = _largest_power_of_two_at_most(dim - offset)
+            block = work_value[..., offset : offset + block_size]
+            h = LinearLowbitFunction._get_hadamard(block_size, block.device, block.dtype)
+            transformed = block @ h
+            if inverse:
+                transformed = transformed / block_size
+            outputs.append(transformed)
+            offset += block_size
+
+        return torch.cat(outputs, dim=-1).to(value.dtype)
     
     @staticmethod
     def svd_quant(
@@ -219,12 +267,6 @@ class LinearLowbitFunction(torch.autograd.Function):
         cache_key: str = "default",
     ) -> torch.Tensor:
         input_ = input_.to(LinearLowbitFunction.compute_dtype)
-        idim = input_.shape[-1]
-        if (not hasattr(LinearLowbitFunction, "h")) and LinearLowbitFunction.enable_nv_recipe:
-            LinearLowbitFunction.hdim = 4096
-            H_scipy = hadamard(LinearLowbitFunction.hdim)
-            LinearLowbitFunction.h = torch.from_numpy(H_scipy).float().to(input_.device)
-
         if LinearLowbitFunction.enable_activation_svd:
             return LinearLowbitFunction.svd_quant(
                 input_,
@@ -240,10 +282,10 @@ class LinearLowbitFunction(torch.autograd.Function):
             )
 
         if LinearLowbitFunction.enable_nv_recipe:
-            input_ = input_ @ LinearLowbitFunction.h[:idim]
+            input_ = LinearLowbitFunction._apply_hadamard_blocks(input_, inverse=False)
         input_ = LinearLowbitFunction.q_forward_input.quantize_dequantize(input_)
         if LinearLowbitFunction.enable_nv_recipe:
-            input_ = input_ @ LinearLowbitFunction.h[:idim].mT / LinearLowbitFunction.hdim
+            input_ = LinearLowbitFunction._apply_hadamard_blocks(input_, inverse=True)
         return input_
 
     @staticmethod
@@ -328,16 +370,15 @@ class LinearLowbitFunction(torch.autograd.Function):
 
                 grad_output *= ug_scalar * vg_scalar
         else:
-            gdim = grad_output.shape[-1]
             if LinearLowbitFunction.enable_nv_recipe:
-                grad_output = grad_output @ LinearLowbitFunction.h[: gdim]
+                grad_output = LinearLowbitFunction._apply_hadamard_blocks(grad_output, inverse=False)
             
             grad_output_scalar = LinearLowbitFunction.q_backward_outputgrad.get_scalar(grad_output)
             
             grad_output = LinearLowbitFunction.q_backward_outputgrad.quant(grad_output, grad_output_scalar)
             grad_output = LinearLowbitFunction.q_backward_outputgrad.rquant(grad_output, grad_output_scalar)
             if LinearLowbitFunction.enable_nv_recipe:
-                grad_output = grad_output @ LinearLowbitFunction.h[: gdim].mT / LinearLowbitFunction.hdim
+                grad_output = LinearLowbitFunction._apply_hadamard_blocks(grad_output, inverse=True)
             
             grad_output = grad_output.reshape(-1, grad_output.shape[-1]).T
             
@@ -419,12 +460,12 @@ class LinearLowbit(torch.nn.Module):
 
         quant_input = weight_compute
         if LinearLowbitFunction.enable_nv_recipe:
-            wdim = quant_input.shape[-1]
-            quant_input = quant_input @ LinearLowbitFunction.h[:wdim]
+            quant_input = LinearLowbitFunction._apply_hadamard_blocks(quant_input, inverse=False)
         quantized_weight = LinearLowbitFunction.q_forward_weight.quantize_dequantize(quant_input)
         if LinearLowbitFunction.enable_nv_recipe:
-            quantized_weight = (
-                quantized_weight @ LinearLowbitFunction.h[:wdim].mT / LinearLowbitFunction.hdim
+            quantized_weight = LinearLowbitFunction._apply_hadamard_blocks(
+                quantized_weight,
+                inverse=True,
             )
 
         if self.cache_quantized_weight:

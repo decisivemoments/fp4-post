@@ -2,6 +2,14 @@
 
 这份文档只说明当前代码里已经存在的检测、分析、日志类在做什么，以及默认是否开启。
 
+> **Current short-run workflow (2026-07-17).** For the 10-step direct-FP4
+> versus QAT+moving-mean study, use
+> [short_run_rollout_analysis.md](short_run_rollout_analysis.md) as the
+> operational guide. The current default is `ANALYZE_ROLLOUT=false`; enabling
+> it records text quality and reward only. Logit capture and automatic plotting
+> are both opt-in (`COLLECT_ROLLOUT_LOGITS=false` and
+> `PLOT_ROLLOUT_ON_TRAIN_END=false` by default).
+
 ## 总开关
 
 检测逻辑主要由 `src/grpo/grpo.py` 里的两个参数控制：

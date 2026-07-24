@@ -485,6 +485,7 @@ def _percentile(values: List[float], p: float) -> float:
 
 def aggregate_step(
     sample_results: List[Dict[str, Any]],
+    texts: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     对同一 step 的 sample-level 结果列表做聚合，
@@ -561,16 +562,28 @@ def aggregate_step(
         reward_summary["reward_mean_by_bad_type"] = reward_by_bad_type
 
     # ── group 相关统计 ─────────────────────────────────────────
+    # GRPO uses within-prompt groups.  Group-level health is more informative
+    # than a global bad ratio: a step can have acceptable global quality while
+    # still containing groups with no usable candidate for a relative update.
     group_summary: Dict[str, Any] = {}
     samples_with_group = [r for r in sample_results if r.get("group_id") is not None]
 
     if samples_with_group:
-        group_bad: Dict[str, Dict[str, int]] = defaultdict(lambda: {"total": 0, "bad": 0})
-        for r in samples_with_group:
+        group_bad: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {"total": 0, "bad": 0, "rewards": [], "texts": []}
+        )
+        for idx, r in enumerate(sample_results):
+            if r.get("group_id") is None:
+                continue
             gid = r["group_id"]
             group_bad[gid]["total"] += 1
             if r["is_bad"]:
                 group_bad[gid]["bad"] += 1
+            if r.get("reward") is not None:
+                group_bad[gid]["rewards"].append(float(r["reward"]))
+            if texts is not None and idx < len(texts):
+                normalized = " ".join(texts[idx].split()).strip().lower()
+                group_bad[gid]["texts"].append(normalized)
 
         group_bad_ratios = [
             v["bad"] / v["total"]
@@ -582,12 +595,48 @@ def aggregate_step(
             sum(group_bad_ratios) / len(group_bad_ratios), 4
         ) if group_bad_ratios else 0.0
         group_summary["group_bad_ratio_p95"] = _percentile(group_bad_ratios, 95)
+        group_summary["all_bad_group_ratio"] = round(
+            sum(v["bad"] == v["total"] for v in group_bad.values()) / len(group_bad), 4
+        )
+
+        reward_stds = []
+        zero_variance_groups = 0
+        duplicate_rates = []
+        for v in group_bad.values():
+            rewards = v["rewards"]
+            if len(rewards) >= 2:
+                mean_reward = sum(rewards) / len(rewards)
+                reward_std = (sum((x - mean_reward) ** 2 for x in rewards) / len(rewards)) ** 0.5
+                reward_stds.append(reward_std)
+                if reward_std == 0.0:
+                    zero_variance_groups += 1
+            group_texts = [text for text in v["texts"] if text]
+            if group_texts:
+                duplicate_rates.append(1.0 - len(set(group_texts)) / len(group_texts))
+
+        if reward_stds:
+            group_summary["group_reward_std_mean"] = round(sum(reward_stds) / len(reward_stds), 4)
+            group_summary["zero_reward_variance_group_ratio"] = round(
+                zero_variance_groups / len(reward_stds), 4
+            )
+        if duplicate_rates:
+            group_summary["exact_duplicate_rate_mean"] = round(
+                sum(duplicate_rates) / len(duplicate_rates), 4
+            )
         # 每个 group 的详情
         group_summary["group_detail"] = {
             gid: {
                 "total": v["total"],
                 "bad_count": v["bad"],
                 "bad_ratio": round(v["bad"] / v["total"], 4),
+                "reward_std": round(
+                    (sum((x - sum(v["rewards"]) / len(v["rewards"])) ** 2 for x in v["rewards"]) / len(v["rewards"])) ** 0.5,
+                    4,
+                ) if len(v["rewards"]) >= 2 else None,
+                "exact_duplicate_rate": round(
+                    1.0 - len(set(text for text in v["texts"] if text)) / len([text for text in v["texts"] if text]),
+                    4,
+                ) if any(v["texts"]) else None,
             }
             for gid, v in group_bad.items()
         }
@@ -716,7 +765,11 @@ def _flatten_step(r: Dict[str, Any]) -> Dict[str, Any]:
     for k in ["reward_mean", "reward_std", "bad_samples_reward_mean", "good_samples_reward_mean"]:
         row[f"rs_{k}"] = rs.get(k, "")
     gs = r.get("group_summary", {})
-    for k in ["num_groups", "group_bad_ratio_mean", "group_bad_ratio_p95"]:
+    for k in [
+        "num_groups", "group_bad_ratio_mean", "group_bad_ratio_p95",
+        "all_bad_group_ratio", "group_reward_std_mean",
+        "zero_reward_variance_group_ratio", "exact_duplicate_rate_mean",
+    ]:
         row[f"gs_{k}"] = gs.get(k, "")
     return row
 

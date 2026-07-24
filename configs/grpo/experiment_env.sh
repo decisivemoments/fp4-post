@@ -34,6 +34,10 @@ export GRPO_EVAL_STRATEGY="${GRPO_EVAL_STRATEGY:-no}"
 export GRPO_GENERATION_USE_CACHE="${GRPO_GENERATION_USE_CACHE:-true}"
 export GRPO_GRADIENT_CHECKPOINTING="${GRPO_GRADIENT_CHECKPOINTING:-true}"
 export ANALYZE_ROLLOUT="${ANALYZE_ROLLOUT:-false}"
+# Keep short diagnostic runs lightweight and collect only text quality/reward.
+# Token-logit capture is optional and currently intended for debugging only.
+export COLLECT_ROLLOUT_LOGITS="${COLLECT_ROLLOUT_LOGITS:-false}"
+export PLOT_ROLLOUT_ON_TRAIN_END="${PLOT_ROLLOUT_ON_TRAIN_END:-false}"
 export USE_CUSTOM_ANALYSIS="${USE_CUSTOM_ANALYSIS:-false}"
 
 export QAT_EPOCHS="${QAT_EPOCHS:-1}"
@@ -59,3 +63,8 @@ export EVALSCOPE_DATASETS="${EVALSCOPE_DATASETS:-aime24 aime25 amc math_500 arc 
 export EVALSCOPE_DATASET_HUB="${EVALSCOPE_DATASET_HUB:-Local}"
 export EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-4}"
 export EVALSCOPE_OUTPUT_ROOT="${EVALSCOPE_OUTPUT_ROOT:-outputs/evalscope}"
+export EVAL_DO_SAMPLE="${EVAL_DO_SAMPLE:-false}"
+export EVAL_TEMPERATURE="${EVAL_TEMPERATURE:-0.0}"
+export EVAL_TOP_K="${EVAL_TOP_K:-0}"
+export EVAL_TOP_P="${EVAL_TOP_P:-1.0}"
+export EVAL_MAX_NEW_TOKENS="${EVAL_MAX_NEW_TOKENS:-2048}"

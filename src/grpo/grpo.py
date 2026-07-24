@@ -72,6 +72,7 @@ class MetisArgs:
         backward_lowrank_svd: int = 64,
         cache_quantized_weight: bool = False,
         compile_qdq: bool = False,
+        enable_nv_recipe: bool = False,
     ):
         self.device = "cuda"
         self.enable_forward_svd = enable_forward_svd
@@ -95,7 +96,7 @@ class MetisArgs:
         self.activation_broadcast_dim = 0
         self.backward_broadcast_dim = -1
         
-        self.enable_nv_recipe = False
+        self.enable_nv_recipe = enable_nv_recipe
         
         self.gradacc_broadcast = False
         self.gradacc_broadcast_steps = 1
@@ -182,7 +183,8 @@ def replace_linear_with_metis(model, dtype, metis_args, target_modules=None, com
                     "quantized_input": None,
                 },
             )
-        new_layer.split()
+        if metis_args.enable_forward_svd:
+            new_layer.split()
         setattr(parent, child_name, new_layer)
     
     return model
@@ -341,7 +343,17 @@ class GRPOScriptArguments(ScriptArguments):
     
     analyze_rollout: bool = field(
         default=False,
-        metadata={"help": "whether analyze rollout text quality, token entropy, probability, token, mismatch"}
+        metadata={"help": "Record rollout text-quality and reward logs."}
+    )
+
+    collect_rollout_logits: bool = field(
+        default=False,
+        metadata={"help": "Capture rollout logits for experimental mismatch analysis (high memory cost)."}
+    )
+
+    plot_rollout_on_train_end: bool = field(
+        default=False,
+        metadata={"help": "Run the legacy per-run QualityAnalyzer when training exits normally."}
     )
 
     generation_use_cache: bool = field(
@@ -388,6 +400,10 @@ class GRPOScriptArguments(ScriptArguments):
     metis_compile_qdq: bool = field(
         default=False,
         metadata={"help": "Compile the fused NVFP4 quantize-dequantize function with torch.compile."}
+    )
+    metis_enable_nv_recipe: bool = field(
+        default=False,
+        metadata={"help": "Apply block Hadamard preconditioning around direct FP4 QDQ paths."}
     )
     metis_merge_rollout_weights: bool = field(
         default=False,
@@ -621,6 +637,7 @@ def main(script_args, training_args, model_args, dataset_args):
             backward_lowrank_svd=script_args.metis_backward_lowrank_svd,
             cache_quantized_weight=script_args.metis_cache_quantized_weight,
             compile_qdq=script_args.metis_compile_qdq,
+            enable_nv_recipe=script_args.metis_enable_nv_recipe,
         )
         model = replace_model_with_metis(model, metis_args)
 
@@ -676,6 +693,7 @@ def main(script_args, training_args, model_args, dataset_args):
             reward_funcs[0],
             log_path=rollout_log_path,
             quality_cfg=quality_cfg,
+            group_size=getattr(training_args, "num_generations", None),
         )
         wrapper.set_model(model)
         reward_funcs[0] = wrapper
@@ -689,9 +707,13 @@ def main(script_args, training_args, model_args, dataset_args):
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
     )
-    if script_args.analyze_rollout:
+    if script_args.analyze_rollout and script_args.collect_rollout_logits:
         capture = RolloutLogitsCapture()
         capture.attach(model)
+    else:
+        capture = None
+
+    if script_args.analyze_rollout:
         diagnostic_cb = MetisDiagnosticCallback(
             model=trainer.model,
             output_dir=training_args.output_dir,
@@ -721,7 +743,7 @@ def main(script_args, training_args, model_args, dataset_args):
     # Log training complete
     trainer.accelerator.print("✅ Training completed.")
 
-    if trainer.accelerator.is_main_process:
+    if trainer.accelerator.is_main_process and script_args.plot_rollout_on_train_end:
         # analyzer = DiagnosticsAnalyzer(training_args.output_dir)
         # analyzer.print_summary()
         # analyzer.plot_all()

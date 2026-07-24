@@ -17,7 +17,8 @@ Stages:
 
 Methods:
   bf16              BF16 GRPO baseline. Valid for stage=grpo.
-  direct_fp4        Fixed W-SVD path; activation and grad both use direct FP4. Valid for stage=grpo.
+  direct_fp4        Direct FP4 without W-SVD/mean residuals. Valid for stage=grpo.
+  hadamard_fp4      Direct FP4 with W/A/G block Hadamard rotation. Valid for stage=grpo.
   qat_fp4           QAT checkpoint; activation and grad both use direct FP4.
   moving_mean       Fixed W-SVD path; activation and grad both use moving mean.
   full              QAT distillation, or GRPO from QAT checkpoint; activation and grad both use moving mean.
@@ -44,6 +45,7 @@ Useful overrides:
   DEEPSPEED_CONFIG=configs/grpo/ds_config_zero2.json
   GRPO_GENERATION_USE_CACHE=true
   GRPO_GRADIENT_CHECKPOINTING=true
+  ANALYZE_ROLLOUT=true COLLECT_ROLLOUT_LOGITS=false PLOT_ROLLOUT_ON_TRAIN_END=false
   METIS_WEIGHT_SVD=true METIS_WEIGHT_SVD_RANK=64 METIS_ACTIVATION_GRAD_RANK=64
   METIS_CACHE_QUANTIZED_WEIGHT=true  # uses extra GPU memory
   METIS_COMPILE_QDQ=true             # compile fused NVFP4 QDQ
@@ -132,6 +134,26 @@ case "${METHOD}" in
             --metis_forward_svd_rank 0
             --metis_cache_quantized_weight "${METIS_CACHE_QUANTIZED_WEIGHT}"
             --metis_compile_qdq "${METIS_COMPILE_QDQ}"
+            --metis_enable_nv_recipe false
+            --metis_enable_activation_svd false
+            --metis_enable_backward_svd false
+            --metis_activation_lowrank_svd 0
+            --metis_backward_lowrank_svd 0
+        )
+        ;;
+    hadamard_fp4)
+        if [[ "${STAGE}" != "grpo" ]]; then
+            echo "Method hadamard_fp4 is only valid for stage=grpo." >&2
+            exit 2
+        fi
+        METIS_ARGS=(
+            --use_metis true
+            --metis_mode mean
+            --metis_enable_forward_svd false
+            --metis_forward_svd_rank 0
+            --metis_cache_quantized_weight "${METIS_CACHE_QUANTIZED_WEIGHT}"
+            --metis_compile_qdq "${METIS_COMPILE_QDQ}"
+            --metis_enable_nv_recipe true
             --metis_enable_activation_svd false
             --metis_enable_backward_svd false
             --metis_activation_lowrank_svd 0
@@ -274,6 +296,8 @@ elif [[ "${STAGE}" == "grpo" ]]; then
         --generation_use_cache "${GRPO_GENERATION_USE_CACHE}" \
         --metis_merge_rollout_weights "${METIS_MERGE_ROLLOUT_WEIGHTS}" \
         --analyze_rollout "${ANALYZE_ROLLOUT}" \
+        --collect_rollout_logits "${COLLECT_ROLLOUT_LOGITS}" \
+        --plot_rollout_on_train_end "${PLOT_ROLLOUT_ON_TRAIN_END}" \
         --resume_from_checkpoint "${GRPO_RESUME}" \
         --use_custom_analysis "${USE_CUSTOM_ANALYSIS}" \
         --logging_steps "${GRPO_LOGGING_STEPS}" \

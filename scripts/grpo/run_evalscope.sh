@@ -171,6 +171,7 @@ DATASET_ARGS_JSON="{\"aime24\":{\"dataset_id\":\"${DATA_ROOT}/evalscope_aime24\"
 echo "Running evalscope: model=${MODEL_PATH} output=${OUT_DIR}"
 echo "Datasets: ${EVALSCOPE_DATASETS}"
 echo "Eval batch size: ${EVAL_BATCH_SIZE}"
+echo "Generation: do_sample=${EVAL_DO_SAMPLE}, temperature=${EVAL_TEMPERATURE}, top_k=${EVAL_TOP_K}, top_p=${EVAL_TOP_P}, max_new_tokens=${EVAL_MAX_NEW_TOKENS}"
 
 evalscope eval \
     --model "${MODEL_PATH}" \
@@ -178,5 +179,6 @@ evalscope eval \
     --dataset-hub "${EVALSCOPE_DATASET_HUB}" \
     --dataset-args "${DATASET_ARGS_JSON}" \
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
+    --generation-config "do_sample=${EVAL_DO_SAMPLE},temperature=${EVAL_TEMPERATURE},top_k=${EVAL_TOP_K},top_p=${EVAL_TOP_P},max_new_tokens=${EVAL_MAX_NEW_TOKENS}" \
     --work-dir "${OUT_DIR}" \
     ${EVALSCOPE_EXTRA_ARGS:-}

@@ -164,11 +164,13 @@ class RolloutRewardWrapper:
         analysis_output_dir: str = None,    # 新增
         analysis_cfg: AnalysisConfig = None, # 新增
         max_text_len: int = 300,
+        group_size: Optional[int] = None,
     ):
         self.reward_fn = reward_fn
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self.max_text_len = max_text_len
+        self.group_size = int(group_size) if group_size and int(group_size) > 0 else None
         self._step = 0
         self._log_file = open(self.log_path, "a", buffering=1, encoding="utf-8")
         self.__name__ = getattr(reward_fn, '__name__', repr(reward_fn))
@@ -222,10 +224,18 @@ class RolloutRewardWrapper:
             float(r) if r is not None else None
             for r in reward_list
         ]
+        group_ids = None
+        # TRL emits candidates prompt-by-prompt for standard GRPO generation.
+        # Record this assumption explicitly and decline to synthesize groups if
+        # the batch shape is inconsistent, rather than logging misleading data.
+        if self.group_size is not None and len(texts) % self.group_size == 0:
+            group_ids = [f"{self._step}:{i // self.group_size}" for i in range(len(texts))]
+
         sample_results = analyze_batch(
             texts=texts,
             step=self._step,
             rewards=reward_floats,
+            group_ids=group_ids,
             cfg=self._quality_cfg,
         )
 
@@ -259,7 +269,7 @@ class RolloutRewardWrapper:
 
         # step 聚合单独写质量日志
         self._quality_logger.log_samples(sample_results)
-        step_agg = aggregate_step(sample_results)
+        step_agg = aggregate_step(sample_results, texts=texts)
         self._quality_logger.log_step(step_agg)
 
         # ── 分析模块（task1 + task2）────────────────────────────────
@@ -524,7 +534,9 @@ class MetisDiagnosticCallback(TrainerCallback):
         self._activation_tensor_buffer.clear()
         self._do_rank_check = False
         
-        buf = self._capture.pop()
+        # Logits capture is optional.  Short rollout-quality runs deliberately
+        # disable it to avoid retaining one vocabulary-sized tensor per token.
+        buf = self._capture.pop() if self._capture is not None else None
         if buf is not None:
             B = buf["prompt_ids"].shape[0]
             for wrapper in self.rollout_wrappers:

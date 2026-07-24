@@ -11,6 +11,7 @@ from Metis.Metis.quant import (
     Cast2NVFp4e2m1BlockNOSR,
     nvfp4_nosr_qdq_compile_status,
 )
+from grpo.grpo import MetisArgs, replace_linear_with_metis
 
 
 def test_quantize_dequantize_matches_existing_sequence():
@@ -95,6 +96,50 @@ def test_mean_activation_path_uses_quantize_dequantize():
 
     assert output.shape == x.shape
     assert CountingQuant.calls == 1
+
+
+def test_block_hadamard_roundtrip_supports_non_power_of_two_hidden_size():
+    x = torch.randn(2, 3, 1536)
+
+    transformed = LinearLowbitFunction._apply_hadamard_blocks(x, inverse=False)
+    actual = LinearLowbitFunction._apply_hadamard_blocks(transformed, inverse=True)
+
+    torch.testing.assert_close(actual, x, rtol=1e-5, atol=1e-5)
+
+
+def test_direct_fp4_path_can_use_hadamard_preconditioning():
+    x = torch.randn(2, 3, 1536)
+    LinearLowbitFunction.compute_dtype = torch.float32
+    LinearLowbitFunction.q_forward_input = Cast2Fp32
+    LinearLowbitFunction.enable_activation_svd = False
+    LinearLowbitFunction.enable_nv_recipe = True
+    try:
+        actual = LinearLowbitFunction.quantize_input(x)
+    finally:
+        LinearLowbitFunction.enable_nv_recipe = False
+
+    torch.testing.assert_close(actual, x, rtol=1e-5, atol=1e-5)
+
+
+def test_replace_linear_does_not_split_when_forward_svd_disabled():
+    model = torch.nn.Sequential(torch.nn.Linear(16, 8, bias=False))
+    args = MetisArgs(enable_forward_svd=False)
+    args.device = "cpu"
+
+    replaced = replace_linear_with_metis(
+        model,
+        dtype=torch.float32,
+        metis_args=args,
+        target_modules=["0"],
+        compute_dtype=torch.float32,
+    )
+    layer = replaced[0]
+
+    assert isinstance(layer.warmup_linear, LinearLowbit)
+    assert layer.vlinear is None
+    assert layer.ulinear is None
+    assert layer.s is None
+    assert not layer.is_svd_quant
 
 
 def test_bitlinear_svd_branches_share_one_quantized_activation():
