@@ -18,7 +18,7 @@ Stages:
 Methods:
   bf16              BF16 GRPO baseline. Valid for stage=grpo.
   direct_fp4        Direct FP4 without W-SVD/mean residuals. Valid for stage=grpo.
-  hadamard_fp4      Direct FP4 with W/A/G block Hadamard rotation. Valid for stage=grpo.
+  hadamard_fp4      Direct FP4 with NVIDIA-style 16-wide RHT on Wgrad operands. Valid for stage=grpo.
   qat_fp4           QAT checkpoint; activation and grad both use direct FP4.
   moving_mean       Fixed W-SVD path; activation and grad both use moving mean.
   full              QAT distillation, or GRPO from QAT checkpoint; activation and grad both use moving mean.
@@ -49,6 +49,9 @@ Useful overrides:
   METIS_WEIGHT_SVD=true METIS_WEIGHT_SVD_RANK=64 METIS_ACTIVATION_GRAD_RANK=64
   METIS_CACHE_QUANTIZED_WEIGHT=true  # uses extra GPU memory
   METIS_COMPILE_QDQ=true             # compile fused NVFP4 QDQ
+  METIS_HADAMARD_BACKEND=auto         # auto, dao_cuda, or torch_gemm
+  METIS_HADAMARD_TILE_SIZE=16         # NVIDIA NVFP4 RHT tile width
+  METIS_HADAMARD_WORKSPACE_MB=128     # fallback GEMM workspace for hadamard_fp4
   METIS_MERGE_ROLLOUT_WEIGHTS=true   # rollout-only merged W-SVD GEMM
 USAGE
 }
@@ -76,7 +79,7 @@ source configs/grpo/experiment_env.sh
 mkdir -p "${GRPO_OUTPUT_ROOT}" "${QAT_OUTPUT_ROOT}"
 echo "Loaded model env: ${LOADED_MODEL_ENV}"
 echo "Runtime config: deepspeed=${DEEPSPEED_CONFIG}, grpo_bs=${GRPO_BATCH_SIZE}, grpo_accum=${GRPO_GRAD_ACCUM}, generations=${GRPO_NUM_GENERATIONS}, max_completion=${GRPO_MAX_COMPLETION_LENGTH}"
-echo "Metis optimization: cache_quantized_weight=${METIS_CACHE_QUANTIZED_WEIGHT}, compile_qdq=${METIS_COMPILE_QDQ}"
+echo "Metis optimization: cache_quantized_weight=${METIS_CACHE_QUANTIZED_WEIGHT}, compile_qdq=${METIS_COMPILE_QDQ}, hadamard_backend=${METIS_HADAMARD_BACKEND:-auto}"
 
 model_path_for_key() {
     case "$1" in
@@ -154,6 +157,9 @@ case "${METHOD}" in
             --metis_cache_quantized_weight "${METIS_CACHE_QUANTIZED_WEIGHT}"
             --metis_compile_qdq "${METIS_COMPILE_QDQ}"
             --metis_enable_nv_recipe true
+            --metis_hadamard_workspace_mb "${METIS_HADAMARD_WORKSPACE_MB:-128}"
+            --metis_hadamard_tile_size "${METIS_HADAMARD_TILE_SIZE:-16}"
+            --metis_hadamard_backend "${METIS_HADAMARD_BACKEND:-auto}"
             --metis_enable_activation_svd false
             --metis_enable_backward_svd false
             --metis_activation_lowrank_svd 0

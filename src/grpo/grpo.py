@@ -73,6 +73,9 @@ class MetisArgs:
         cache_quantized_weight: bool = False,
         compile_qdq: bool = False,
         enable_nv_recipe: bool = False,
+        hadamard_workspace_mb: int = 128,
+        hadamard_tile_size: int = 16,
+        hadamard_backend: str = "auto",
     ):
         self.device = "cuda"
         self.enable_forward_svd = enable_forward_svd
@@ -97,6 +100,9 @@ class MetisArgs:
         self.backward_broadcast_dim = -1
         
         self.enable_nv_recipe = enable_nv_recipe
+        self.hadamard_workspace_mb = hadamard_workspace_mb
+        self.hadamard_tile_size = hadamard_tile_size
+        self.hadamard_backend = hadamard_backend
         
         self.gradacc_broadcast = False
         self.gradacc_broadcast_steps = 1
@@ -403,7 +409,19 @@ class GRPOScriptArguments(ScriptArguments):
     )
     metis_enable_nv_recipe: bool = field(
         default=False,
-        metadata={"help": "Apply block Hadamard preconditioning around direct FP4 QDQ paths."}
+        metadata={"help": "Apply NVIDIA-style tiled RHT only to Wgrad operands in direct FP4."}
+    )
+    metis_hadamard_workspace_mb: int = field(
+        default=128,
+        metadata={"help": "Maximum FP32 workspace (MiB) for chunked Hadamard preconditioning."}
+    )
+    metis_hadamard_tile_size: int = field(
+        default=16,
+        metadata={"help": "Power-of-two RHT tile width; NVIDIA NVFP4 uses 16."}
+    )
+    metis_hadamard_backend: str = field(
+        default="auto",
+        metadata={"help": "Hadamard backend: auto, dao_cuda, or torch_gemm."}
     )
     metis_merge_rollout_weights: bool = field(
         default=False,
@@ -638,6 +656,9 @@ def main(script_args, training_args, model_args, dataset_args):
             cache_quantized_weight=script_args.metis_cache_quantized_weight,
             compile_qdq=script_args.metis_compile_qdq,
             enable_nv_recipe=script_args.metis_enable_nv_recipe,
+            hadamard_workspace_mb=script_args.metis_hadamard_workspace_mb,
+            hadamard_tile_size=script_args.metis_hadamard_tile_size,
+            hadamard_backend=script_args.metis_hadamard_backend,
         )
         model = replace_model_with_metis(model, metis_args)
 

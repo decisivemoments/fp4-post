@@ -107,7 +107,22 @@ def test_block_hadamard_roundtrip_supports_non_power_of_two_hidden_size():
     torch.testing.assert_close(actual, x, rtol=1e-5, atol=1e-5)
 
 
-def test_direct_fp4_path_can_use_hadamard_preconditioning():
+def test_block_hadamard_roundtrip_respects_small_workspace_budget():
+    # With 16-wide RHT tiles, a 1 MiB budget forces multiple fallback GEMM
+    # chunks while preserving the exact inverse relation.
+    x = torch.randn(64, 1536)
+    original_budget = LinearLowbitFunction.hadamard_workspace_mb
+    LinearLowbitFunction.hadamard_workspace_mb = 1
+    try:
+        transformed = LinearLowbitFunction._apply_hadamard_blocks(x, inverse=False)
+        actual = LinearLowbitFunction._apply_hadamard_blocks(transformed, inverse=True)
+    finally:
+        LinearLowbitFunction.hadamard_workspace_mb = original_budget
+
+    torch.testing.assert_close(actual, x, rtol=1e-5, atol=1e-5)
+
+
+def test_direct_fp4_forward_path_remains_available_with_nv_rht_enabled():
     x = torch.randn(2, 3, 1536)
     LinearLowbitFunction.compute_dtype = torch.float32
     LinearLowbitFunction.q_forward_input = Cast2Fp32
@@ -119,6 +134,30 @@ def test_direct_fp4_path_can_use_hadamard_preconditioning():
         LinearLowbitFunction.enable_nv_recipe = False
 
     torch.testing.assert_close(actual, x, rtol=1e-5, atol=1e-5)
+
+
+def test_nv_rht_is_limited_to_wgrad_operands_and_preserves_identity_qdq():
+    args = SimpleNamespace(device="cpu", cache_quantized_weight=False)
+    layer = LinearLowbit(16, 16, bias=False, args=args)
+    LinearLowbitFunction.compute_dtype = torch.float32
+    LinearLowbitFunction.q_forward_input = Cast2Fp32
+    LinearLowbitFunction.q_forward_weight = Cast2Fp32
+    LinearLowbitFunction.q_backward_input = Cast2Fp32
+    LinearLowbitFunction.q_backward_outputgrad = Cast2Fp32
+    LinearLowbitFunction.enable_activation_svd = False
+    LinearLowbitFunction.enable_backward_svd = False
+    LinearLowbitFunction.enable_nv_recipe = True
+    LinearLowbitFunction.hadamard_backend = "torch_gemm"
+    LinearLowbitFunction.hadamard_tile_size = 16
+
+    x = torch.randn(2, 3, 16, requires_grad=True)
+    try:
+        layer(x).sum().backward()
+    finally:
+        LinearLowbitFunction.enable_nv_recipe = False
+
+    expected_weight_grad = torch.ones(16, 1) @ x.detach().reshape(-1, 16).sum(dim=0, keepdim=True)
+    torch.testing.assert_close(layer.weight.grad, expected_weight_grad, rtol=1e-5, atol=1e-5)
 
 
 def test_replace_linear_does_not_split_when_forward_svd_disabled():

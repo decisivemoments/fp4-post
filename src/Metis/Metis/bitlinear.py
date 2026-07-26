@@ -33,7 +33,21 @@ class LinearLowbitFunction(torch.autograd.Function):
     q_backward_outputgrad = Cast2Fp4e2m1
     
     enable_nv_recipe = False
+    # Cache the small, block-local Hadamard matrices.  These are reused by all
+    # projections on one device and are much cheaper than rebuilding them.
     _hadamard_cache = {}
+
+    # Bound temporary FP32 storage used by the block Hadamard preconditioner.
+    # The final result still has the same dtype and shape as the input.
+    hadamard_workspace_mb = 128
+    # NVIDIA's RHT recipe uses fixed 16-wide tiles for the Wgrad operands.
+    hadamard_tile_size = 16
+    # ``auto`` prefers Dao-AILab's CUDA extension and falls back to chunked
+    # cached-GEMM only when that optional dependency is unavailable.
+    hadamard_backend = "auto"
+    _dao_hadamard_transform = None
+    _dao_hadamard_checked = False
+    _hadamard_sign_cache = {}
 
     # Low-rank iteration counts for randomized SVD
     activation_lowrank_niter = 0
@@ -60,6 +74,7 @@ class LinearLowbitFunction(torch.autograd.Function):
 
     @staticmethod
     def _get_hadamard(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return a cached Sylvester Hadamard matrix of the requested size."""
         cache_key = (int(size), device, dtype)
         cached = LinearLowbitFunction._hadamard_cache.get(cache_key)
         if cached is not None:
@@ -68,39 +83,132 @@ class LinearLowbitFunction(torch.autograd.Function):
         if size <= 0 or (size & (size - 1)) != 0:
             raise ValueError(f"Hadamard block size must be a power of two, got {size}")
 
-        h = torch.ones((1, 1), device=device, dtype=dtype)
-        while h.shape[0] < size:
-            h = torch.cat(
+        hadamard = torch.ones((1, 1), device=device, dtype=dtype)
+        while hadamard.shape[0] < size:
+            hadamard = torch.cat(
                 (
-                    torch.cat((h, h), dim=1),
-                    torch.cat((h, -h), dim=1),
+                    torch.cat((hadamard, hadamard), dim=1),
+                    torch.cat((hadamard, -hadamard), dim=1),
                 ),
                 dim=0,
             )
-        LinearLowbitFunction._hadamard_cache[cache_key] = h
-        return h
+        LinearLowbitFunction._hadamard_cache[cache_key] = hadamard
+        return hadamard
+
+    @staticmethod
+    def _get_hadamard_sign(size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Return one deterministic, shared RHT sign vector per tile size."""
+        cache_key = (int(size), device, dtype)
+        cached = LinearLowbitFunction._hadamard_sign_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(1729 + size)
+        signs = torch.randint(0, 2, (size,), generator=generator, dtype=torch.int8)
+        signs = signs.mul_(2).sub_(1).to(device=device, dtype=dtype)
+        LinearLowbitFunction._hadamard_sign_cache[cache_key] = signs
+        return signs
+
+    @staticmethod
+    def _get_dao_hadamard_transform():
+        """Lazily load the optional fused CUDA Hadamard extension once."""
+        if not LinearLowbitFunction._dao_hadamard_checked:
+            try:
+                from fast_hadamard_transform import hadamard_transform
+                LinearLowbitFunction._dao_hadamard_transform = hadamard_transform
+            except ImportError:
+                LinearLowbitFunction._dao_hadamard_transform = None
+            LinearLowbitFunction._dao_hadamard_checked = True
+        return LinearLowbitFunction._dao_hadamard_transform
 
     @staticmethod
     def _apply_hadamard_blocks(value: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        """Apply tiled random Hadamard rotations with a CUDA-kernel fast path.
+
+        For dimensions divisible by the configured tile size (16 by default),
+        all tiles are flattened into one batch. The optional Dao-AILab CUDA
+        extension then performs one fused FWHT launch. The fallback keeps the
+        same algebra but uses bounded, cached-GEMM chunks, never ``torch.cat``.
+        """
         dim = value.shape[-1]
         if dim <= 1:
             return value
+        if value.numel() == 0:
+            return value
 
-        outputs = []
-        offset = 0
-        hadamard_dtype = torch.float32 if value.dtype in (torch.float16, torch.bfloat16) else value.dtype
-        work_value = value.to(hadamard_dtype)
-        while offset < dim:
-            block_size = _largest_power_of_two_at_most(dim - offset)
-            block = work_value[..., offset : offset + block_size]
-            h = LinearLowbitFunction._get_hadamard(block_size, block.device, block.dtype)
-            transformed = block @ h
+        tile_size = int(LinearLowbitFunction.hadamard_tile_size)
+        if tile_size <= 0 or (tile_size & (tile_size - 1)):
+            raise ValueError(f"Hadamard tile size must be a positive power of two, got {tile_size}")
+        if dim % tile_size:
+            raise ValueError(
+                f"RHT tile size {tile_size} must divide hidden dimension {dim}; "
+                "set --metis_hadamard_tile_size to a compatible power of two"
+            )
+
+        backend = LinearLowbitFunction.hadamard_backend
+        if backend not in {"auto", "dao_cuda", "torch_gemm"}:
+            raise ValueError(f"Unsupported Hadamard backend: {backend}")
+
+        # The Dao extension accepts BF16 directly and has one output allocation.
+        # It is intentionally used only for CUDA tensors; CPU tests and explicit
+        # fallback runs retain the portable GEMM implementation below.
+        dao_transform = (
+            LinearLowbitFunction._get_dao_hadamard_transform()
+            if backend in {"auto", "dao_cuda"} and value.is_cuda
+            else None
+        )
+        if backend == "dao_cuda" and dao_transform is None:
+            raise RuntimeError(
+                "Hadamard backend dao_cuda was requested but fast_hadamard_transform is unavailable. "
+                "Install it with: pip install -v git+https://github.com/Dao-AILab/fast-hadamard-transform.git"
+            )
+
+        flat_value = value.reshape(-1, tile_size)
+        signs = LinearLowbitFunction._get_hadamard_sign(tile_size, value.device, value.dtype)
+        if dao_transform is not None:
             if inverse:
-                transformed = transformed / block_size
-            outputs.append(transformed)
+                transformed = dao_transform(flat_value, scale=1.0 / tile_size)
+                transformed = transformed * signs
+            else:
+                transformed = dao_transform(flat_value * signs, scale=1.0)
+            return transformed.reshape_as(value)
+
+        hadamard_dtype = torch.float32 if value.dtype in (torch.float16, torch.bfloat16) else value.dtype
+        flat_value = value.reshape(-1, dim)
+        flat_output = torch.empty_like(flat_value)
+        max_workspace_bytes = max(1, int(LinearLowbitFunction.hadamard_workspace_mb)) * 1024 * 1024
+
+        offset = 0
+        while offset < dim:
+            block_size = tile_size
+            # One FP32 input workspace and one FP32 GEMM result are live per
+            # chunk. The final-dtype output is preallocated separately.
+            bytes_per_row = 8 * block_size * torch.empty((), dtype=hadamard_dtype).element_size()
+            chunk_rows = max(1, max_workspace_bytes // bytes_per_row)
+            hadamard = LinearLowbitFunction._get_hadamard(
+                block_size, flat_value.device, hadamard_dtype
+            )
+
+            for row_start in range(0, flat_value.shape[0], chunk_rows):
+                row_end = min(row_start + chunk_rows, flat_value.shape[0])
+                # BF16/FP16 inputs are promoted for the rotation. For FP32,
+                # this is a view and ``torch.mm`` remains non-mutating.
+                work = flat_value[row_start:row_end, offset : offset + block_size].to(hadamard_dtype)
+                signs = LinearLowbitFunction._get_hadamard_sign(
+                    block_size, work.device, hadamard_dtype
+                )
+                if inverse:
+                    transformed = torch.mm(work, hadamard)
+                    transformed.mul_(1.0 / block_size).mul_(signs)
+                else:
+                    # x S H is a random Hadamard rotation; the inverse is
+                    # H S / d, used above after dequantization.
+                    transformed = torch.mm(work * signs, hadamard)
+                flat_output[row_start:row_end, offset : offset + block_size].copy_(transformed)
             offset += block_size
 
-        return torch.cat(outputs, dim=-1).to(value.dtype)
+        return flat_output.reshape_as(value)
     
     @staticmethod
     def svd_quant(
@@ -281,12 +389,20 @@ class LinearLowbitFunction(torch.autograd.Function):
                 cache_key=cache_key,
             )
 
-        if LinearLowbitFunction.enable_nv_recipe:
-            input_ = LinearLowbitFunction._apply_hadamard_blocks(input_, inverse=False)
         input_ = LinearLowbitFunction.q_forward_input.quantize_dequantize(input_)
-        if LinearLowbitFunction.enable_nv_recipe:
-            input_ = LinearLowbitFunction._apply_hadamard_blocks(input_, inverse=True)
         return input_
+
+    @staticmethod
+    def _quantize_wgrad_operand(value: torch.Tensor, quantizer) -> torch.Tensor:
+        """QDQ one Wgrad operand, with RHT only for the NV-Hadamard baseline."""
+        if LinearLowbitFunction.enable_nv_recipe:
+            value = LinearLowbitFunction._apply_hadamard_blocks(value, inverse=False)
+        scalar = quantizer.get_scalar(value)
+        value = quantizer.quant(value, scalar)
+        value = quantizer.rquant(value, scalar)
+        if LinearLowbitFunction.enable_nv_recipe:
+            value = LinearLowbitFunction._apply_hadamard_blocks(value, inverse=True)
+        return value
 
     @staticmethod
     def forward(
@@ -370,22 +486,22 @@ class LinearLowbitFunction(torch.autograd.Function):
 
                 grad_output *= ug_scalar * vg_scalar
         else:
-            if LinearLowbitFunction.enable_nv_recipe:
-                grad_output = LinearLowbitFunction._apply_hadamard_blocks(grad_output, inverse=False)
-            
-            grad_output_scalar = LinearLowbitFunction.q_backward_outputgrad.get_scalar(grad_output)
-            
-            grad_output = LinearLowbitFunction.q_backward_outputgrad.quant(grad_output, grad_output_scalar)
-            grad_output = LinearLowbitFunction.q_backward_outputgrad.rquant(grad_output, grad_output_scalar)
-            if LinearLowbitFunction.enable_nv_recipe:
-                grad_output = LinearLowbitFunction._apply_hadamard_blocks(grad_output, inverse=True)
-            
+            grad_output = LinearLowbitFunction._quantize_wgrad_operand(
+                grad_output, LinearLowbitFunction.q_backward_outputgrad
+            )
             grad_output = grad_output.reshape(-1, grad_output.shape[-1]).T
             
             
+        wgrad_input = input_
+        if LinearLowbitFunction.enable_nv_recipe:
+            # RHT is intentionally limited to the two Wgrad operands. We do
+            # not rotate forward activations or weights for this NV baseline.
+            wgrad_input = LinearLowbitFunction._quantize_wgrad_operand(
+                input_, LinearLowbitFunction.q_backward_input
+            )
         grad_weight = torch.matmul(
             grad_output,
-            input_.reshape(-1, input_.shape[-1])
+            wgrad_input.reshape(-1, wgrad_input.shape[-1])
         )
     
         grad_output = grad_output.T.reshape(grad_output_shape0, grad_output_shape1, grad_output_shape2)
@@ -535,6 +651,9 @@ class BitLinear(nn.Module):
         LinearLowbitFunction.activation_broadcast_dim = args.activation_broadcast_dim
         LinearLowbitFunction.backward_broadcast_dim = args.backward_broadcast_dim
         LinearLowbitFunction.enable_nv_recipe = args.enable_nv_recipe
+        LinearLowbitFunction.hadamard_workspace_mb = getattr(args, "hadamard_workspace_mb", 128)
+        LinearLowbitFunction.hadamard_tile_size = getattr(args, "hadamard_tile_size", 16)
+        LinearLowbitFunction.hadamard_backend = getattr(args, "hadamard_backend", "auto")
         
         LinearLowbitFunction.tp_simulation = args.tp_simulation
         LinearLowbitFunction.tp_parts = args.tp_parts

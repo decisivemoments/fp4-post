@@ -75,7 +75,7 @@ Figure~\ref{fig:pipeline} provides an overview of the proposed two-stage pipelin
 \begin{figure*}[!t]
     \centering
     \includegraphics[width=\textwidth]{Figures/fp4_post_training_pipeline.pdf}
-    \caption{Overview of FP4 post-training. Stage~I distills a BF16 teacher into an FP4 student on teacher-generated responses. Stage~II uses the adapted FP4 policy to generate GRPO rollouts and updates it using group-relative rewards. Within the FP4 linear operator, weights follow the fixed SVD decomposition path, whereas activations and gradients are quantized after mean-residual decomposition; a causal moving-mean cache supplies the activation mean during autoregressive decoding.}
+    \caption{Overview of FP4 post-training. In Stage~I, the ice-blue teacher robot and snowflake denote frozen BF16 parameters, whereas the warm FP4 student robot is updated by masked token-level distillation. Stage~II uses the adapted FP4 policy to generate GRPO rollouts and updates it using group-relative rewards. The grid blocks visualize the fixed weight decomposition $U_r\Sigma_rV_r^\top+R_W$ and the mean-residual splits for activations and output gradients; only the residual matrices use FP4 quantization, and a causal moving-mean cache supplies the activation mean during autoregressive decoding.}
     \label{fig:pipeline}
 \end{figure*}
 

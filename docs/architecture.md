@@ -141,6 +141,23 @@ Most scripts still contain machine-specific absolute dataset/model paths. Before
 | `CUDA_VISIBLE_DEVICES` | GPU selection. |
 | `--output_dir` / `--log-dir` | Output location, normally under `outputs/`. |
 
+### NV-Hadamard baseline
+
+`hadamard_fp4` implements a tiled, 16-wide RHT around the two Wgrad operands
+only; it does not rotate forward activations or weights. The default
+`METIS_HADAMARD_BACKEND=auto` uses the Dao-AILab CUDA extension when installed
+and otherwise falls back to a bounded cached-GEMM implementation. Install the
+fast backend in the training CUDA environment with:
+
+```bash
+pip install -v git+https://github.com/Dao-AILab/fast-hadamard-transform.git
+```
+
+Use `METIS_HADAMARD_BACKEND=dao_cuda` to require the extension, or
+`METIS_HADAMARD_BACKEND=torch_gemm` for the portable fallback. The model's
+input and output projection dimensions must be divisible by
+`METIS_HADAMARD_TILE_SIZE` (default: `16`).
+
 ## Output Policy
 
 Generated artifacts do not belong in git. `.gitignore` excludes:

@@ -11,21 +11,37 @@
   stage/.style={draw=#1!80!black, rounded corners=3pt, line width=.9pt, fill=#1!7, inner sep=4.5mm},
   process/.style={draw=#1!85!black, rounded corners=2pt, fill=#1!15, align=center, minimum height=9mm, minimum width=26mm, font=\small},
   tinyprocess/.style={draw=#1!85!black, rounded corners=2pt, fill=#1!15, align=center, minimum height=7mm, minimum width=22mm, font=\scriptsize},
+  matrix/.style={draw=#1!85!black, rounded corners=1pt, fill=#1!15, minimum width=12mm, minimum height=9mm, align=center, font=\scriptsize,
+    path picture={\draw[black!16, line width=.25pt, step=1.8mm] (path picture bounding box.south west) grid (path picture bounding box.north east);}},
   label/.style={font=\bfseries\small, text=#1!80!black}
+}
+\newcommand{\roboticon}[3]{%
+  \begin{scope}[shift={#1}]
+    \draw[rounded corners=1.2pt, line width=.6pt, draw=#2!85!black, fill=#2!22] (-.37,-.23) rectangle (.37,.23);
+    \draw[line width=.55pt, draw=#2!85!black] (0,.23) -- (0,.37);
+    \fill[#2!85!black] (0,.41) circle (.045);
+    \fill[#2!85!black] (-.16,.035) circle (.045);
+    \fill[#2!85!black] (.16,.035) circle (.045);
+    \draw[line width=.45pt, draw=#2!85!black] (-.17,-.105) -- (.17,-.105);
+    \draw[line width=.55pt, draw=#2!85!black] (-.49,-.08) -- (-.37,-.08) (.37,-.08) -- (.49,-.08);
+    \node[font=\scriptsize\bfseries, text=#2!90!black, align=center] at (0,-.58) {#3};
+  \end{scope}%
 }
 \begin{document}
 \begin{tikzpicture}[x=1cm,y=1cm]
-  % Inputs and QAT stage.
+  % Stage I: teacher/student roles are intentionally shown as distinct agents.
   \node[data, minimum width=22mm] (prompts) at (1.15,5.85) {Prompts\\$x\sim\mathcal{D}$};
-  \node[stage=bfblue, minimum width=112mm, minimum height=25mm, anchor=west] (qatbox) at (3.0,5.85) {};
+  \node[stage=bfblue, minimum width=112mm, minimum height=30mm, anchor=west] (qatbox) at (3.0,5.85) {};
   \node[label=bfblue, anchor=north west] at ($(qatbox.north west)+(0.18,-0.13)$) {Stage I: Quantization-aware self-distillation};
-  \node[process=bfblue, minimum width=34mm] (teacher) at (6.1,5.62) {Frozen BF16 teacher\\sample $y$ and logits};
-  \node[process=fporange, minimum width=34mm] (student) at (12.2,5.62) {FP4 student\\masked token KL};
-  \draw[arrow] (prompts) -- (teacher);
-  \draw[arrow] (teacher) -- node[above, font=\scriptsize] {$y$, top-$k$ logits} (student);
-  \node[font=\scriptsize] at (9.15,4.93) {$\mathcal{L}_{\mathrm{KD}}=T^2\!\sum_{t\in y}\mathrm{KL}(p_T\Vert p_S)$};
+  \roboticon{(5.65,5.44)}{bfblue}{Frozen BF16\\teacher}
+  \roboticon{(11.95,5.44)}{fporange}{Trainable FP4\\student}
+  % Snowflake-like mark makes the frozen-weight role visible without relying on text alone.
+  \draw[bfblue, line width=.45pt] (6.34,4.83) -- (6.70,5.19) (6.34,5.19) -- (6.70,4.83) (6.52,4.77) -- (6.52,5.25);
+  \draw[arrow] (prompts) -- (5.17,5.44);
+  \draw[arrow] (6.12,5.44) -- node[above, font=\scriptsize] {$y$, top-$k$ logits} (11.48,5.44);
+  \node[font=\scriptsize] at (8.80,4.84) {$\mathcal{L}_{\mathrm{KD}}=T^2\!\sum_{t\in y}\mathrm{KL}(p_T\Vert p_S)$};
 
-  % GRPO stage.
+  % Stage II: GRPO dataflow.
   \node[stage=rewardgreen, minimum width=172mm, minimum height=25mm, anchor=west] (grpo) at (0.1,2.85) {};
   \node[label=rewardgreen, anchor=north west] at ($(grpo.north west)+(0.18,-0.13)$) {Stage II: FP4 GRPO post-training};
   \node[process=fporange, minimum width=30mm] (policy) at (2.65,2.58) {QAT-adapted\\FP4 policy $\pi_\theta$};
@@ -36,19 +52,38 @@
   \draw[arrow] (rollout) -- (reward);
   \draw[arrow] (reward) -- (update);
 
-  % Quantized linear-layer inset. These are parallel components of the policy,
-  % not additional steps in the rollout/update data flow.
+  % The FP4 operator is shown as three concrete matrix constructions rather than text-only boxes.
   \node[stage=meanpurple, minimum width=172mm, minimum height=46mm, anchor=west] (quant) at (0.1,-1.50) {};
   \node[label=meanpurple, anchor=north west] at ($(quant.north west)+(0.18,-0.13)$) {FP4 linear operator inside the policy};
-  \node[tinyprocess=fporange, minimum width=34mm, minimum height=12mm] (weight) at (4.00,-0.98) {Weight path $W$\\fixed $W\approx U\Sigma V^\top$\\FP4 factors};
-  \node[tinyprocess=meanpurple, minimum width=34mm, minimum height=12mm] (act) at (8.65,-0.98) {Activation path $X$\\$X=\mathbf{1}\mu_X^\top+R_X$\\quantize $R_X$ in FP4};
-  \node[tinyprocess=meanpurple, minimum width=34mm, minimum height=12mm] (grad) at (13.30,-0.98) {Gradient path $G$\\$G=\mathbf{1}\mu_G^\top+R_G$\\quantize $R_G$ in FP4};
+
+  \node[font=\scriptsize\bfseries, text=fporange!90!black] at (3.98,-0.65) {Weight $W$: spectral path};
+  \node[matrix=bfblue] (u) at (2.35,-1.20) {$U_r$};
+  \node[font=\large] at (3.28,-1.20) {$\times$};
+  \node[matrix=fporange] (sigma) at (4.10,-1.20) {$\Sigma_r$};
+  \node[font=\large] at (5.02,-1.20) {$\times$};
+  \node[matrix=bfblue] (v) at (5.84,-1.20) {$V_r^\top$};
+  \node[font=\large] at (6.76,-1.20) {$+$};
+  \node[matrix=fporange] (rw) at (7.58,-1.20) {$R_W$};
+  \node[font=\scriptsize, text=fporange!90!black] at (4.95,-1.90) {FP4 on $V_r^\top$ and $R_W$};
+
+  \node[font=\scriptsize\bfseries, text=meanpurple!90!black] at (10.85,-0.65) {Mean-residual paths};
+  \node[font=\scriptsize, anchor=east] at (9.15,-1.20) {$X=$};
+  \node[matrix=meanpurple, minimum width=15mm] (mux) at (10.20,-1.20) {$\mathbf{1}\mu_X^\top$};
+  \node[font=\large] at (11.32,-1.20) {$+$};
+  \node[matrix=meanpurple] (rx) at (12.23,-1.20) {$R_X$};
+  \node[font=\scriptsize, text=meanpurple!90!black] at (11.20,-1.90) {FP4 on residual $R_X$};
+  \node[font=\scriptsize, anchor=east] at (13.45,-1.20) {$D=$};
+  \node[matrix=meanpurple, minimum width=15mm] (mud) at (14.48,-1.20) {$\mathbf{1}\mu_D^\top$};
+  \node[font=\large] at (15.60,-1.20) {$+$};
+  \node[matrix=meanpurple] (rd) at (16.48,-1.20) {$R_D$};
+  \node[font=\scriptsize, text=meanpurple!90!black] at (15.45,-1.90) {FP4 on residual $R_D$};
+
   \node[draw=rewardgreen!85!black, dashed, rounded corners=2pt, fill=rewardgreen!5, minimum width=145mm, minimum height=14mm] (actcachegroup) at (9.0,-2.80) {};
   \node[label=rewardgreen, anchor=north west, font=\bfseries\scriptsize] at ($(actcachegroup.north west)+(0.14,-0.10)$) {Causal activation mean during autoregressive decoding};
   \node[tinyprocess=rewardgreen, minimum width=27mm, minimum height=8mm] (prefill) at (4.55,-2.93) {Prompt prefill\\compute $\mu_0,n_0$};
   \node[tinyprocess=rewardgreen, minimum width=29mm, minimum height=8mm] (cache) at (8.95,-2.93) {Causal cache\\$(\mu_{\mathrm{cache}},n_{\mathrm{cache}})$};
   \node[tinyprocess=rewardgreen, minimum width=35mm, minimum height=8mm] (decode) at (14.05,-2.93) {Decode step $t$\\update with $\mu_t,n_t$};
-  \draw[arrow, draw=rewardgreen!85!black] (act.south) -- (actcachegroup.north);
+  \draw[arrow, draw=rewardgreen!85!black] (mux.south) -- (actcachegroup.north);
   \draw[arrow, draw=rewardgreen!85!black] (prefill) -- (cache);
   \draw[arrow, draw=rewardgreen!85!black] (cache) -- (decode);
 \end{tikzpicture}
