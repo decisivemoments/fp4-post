@@ -54,29 +54,29 @@
 
   % The FP4 operator is shown as three concrete matrix constructions rather than text-only boxes.
   \node[stage=meanpurple, minimum width=172mm, minimum height=46mm, anchor=west] (quant) at (0.1,-1.50) {};
-  \node[label=meanpurple, anchor=north west] at ($(quant.north west)+(0.18,-0.13)$) {FP4 linear operator inside the policy};
+  \node[label=meanpurple, anchor=north west] at ($(quant.north west)+(0.18,-0.13)$) {NVFP4 linear operator inside the policy};
 
   \node[font=\scriptsize\bfseries, text=fporange!90!black] at (3.98,-0.65) {Weight $W$: spectral path};
-  \node[matrix=bfblue] (u) at (2.35,-1.20) {$U_r$};
+  \node[matrix=fporange] (u) at (2.35,-1.20) {$U_r$};
   \node[font=\large] at (3.28,-1.20) {$\times$};
-  \node[matrix=fporange] (sigma) at (4.10,-1.20) {$\Sigma_r$};
+  \node[matrix=bfblue] (sigma) at (4.10,-1.20) {$\Sigma_r$};
   \node[font=\large] at (5.02,-1.20) {$\times$};
-  \node[matrix=bfblue] (v) at (5.84,-1.20) {$V_r^\top$};
+  \node[matrix=fporange] (v) at (5.84,-1.20) {$V_r^\top$};
   \node[font=\large] at (6.76,-1.20) {$+$};
   \node[matrix=fporange] (rw) at (7.58,-1.20) {$R_W$};
-  \node[font=\scriptsize, text=fporange!90!black] at (4.95,-1.90) {FP4 on $V_r^\top$ and $R_W$};
+  \node[font=\scriptsize, text=fporange!90!black] at (4.95,-1.90) {NVFP4 on $U_r$, $V_r^\top$, and $R_W$};
 
   \node[font=\scriptsize\bfseries, text=meanpurple!90!black] at (10.85,-0.65) {Mean-residual paths};
   \node[font=\scriptsize, anchor=east] at (9.15,-1.20) {$X=$};
   \node[matrix=meanpurple, minimum width=15mm] (mux) at (10.20,-1.20) {$\mathbf{1}\mu_X^\top$};
   \node[font=\large] at (11.32,-1.20) {$+$};
   \node[matrix=meanpurple] (rx) at (12.23,-1.20) {$R_X$};
-  \node[font=\scriptsize, text=meanpurple!90!black] at (11.20,-1.90) {FP4 on residual $R_X$};
+  \node[font=\scriptsize, text=meanpurple!90!black] at (11.20,-1.90) {NVFP4 on residual $R_X$};
   \node[font=\scriptsize, anchor=east] at (13.45,-1.20) {$D=$};
   \node[matrix=meanpurple, minimum width=15mm] (mud) at (14.48,-1.20) {$\mathbf{1}\mu_D^\top$};
   \node[font=\large] at (15.60,-1.20) {$+$};
   \node[matrix=meanpurple] (rd) at (16.48,-1.20) {$R_D$};
-  \node[font=\scriptsize, text=meanpurple!90!black] at (15.45,-1.90) {FP4 on residual $R_D$};
+  \node[font=\scriptsize, text=meanpurple!90!black] at (15.45,-1.90) {NVFP4 on residual $R_D$};
 
   \node[draw=rewardgreen!85!black, dashed, rounded corners=2pt, fill=rewardgreen!5, minimum width=145mm, minimum height=14mm] (actcachegroup) at (9.0,-2.80) {};
   \node[label=rewardgreen, anchor=north west, font=\bfseries\scriptsize] at ($(actcachegroup.north west)+(0.14,-0.10)$) {Causal activation mean during autoregressive decoding};

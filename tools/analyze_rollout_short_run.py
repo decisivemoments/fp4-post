@@ -151,8 +151,8 @@ def main():
     plot_time_series(before, after, "bad_ratio", "Bad completion ratio",
                      "Direct FP4 vs. Mean self-distillation",
                      Path(f"{prefix}_bad_ratio"), args.max_steps)
-    plot_time_series(before, after, "reward_mean", "Mean reward",
-                     "Reward signal with Mean self-distillation",
+    plot_time_series(before, after, "reward_mean", "Mean logged task reward",
+                     "Mean logged task reward with Mean self-distillation",
                      Path(f"{prefix}_reward"), args.max_steps)
     counts, bad_count, total_count = load_bad_type_distribution(args.before, args.max_steps)
     plot_bad_type_distribution(counts, bad_count, total_count,

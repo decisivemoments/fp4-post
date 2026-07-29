@@ -81,7 +81,7 @@ def main():
 
     panels = [
         ("Bad rollout rate", "Fraction of completions", lambda r: r.get("bad_ratio", 0.0), True),
-        ("Reward signal", "Mean reward", lambda r: r.get("reward_summary", {}).get("reward_mean"), False),
+        ("Mean logged task reward", "Mean logged task reward", lambda r: r.get("reward_summary", {}).get("reward_mean"), False),
         ("Generation diversity", "Unique-token ratio", lambda r: r.get("metric_summary", {}).get("unique_token_ratio_mean"), False),
     ]
     for axis, (title, ylabel, getter, band) in zip(axes, panels):
