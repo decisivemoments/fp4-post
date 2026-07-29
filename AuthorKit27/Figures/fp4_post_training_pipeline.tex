@@ -31,20 +31,20 @@
 \begin{tikzpicture}[x=1cm,y=1cm]
   % Stage I: teacher/student roles are intentionally shown as distinct agents.
   \node[data, minimum width=22mm] (prompts) at (1.15,5.85) {Prompts\\$x\sim\mathcal{D}$};
-  \node[stage=bfblue, minimum width=112mm, minimum height=30mm, anchor=west] (qatbox) at (3.0,5.85) {};
-  \node[label=bfblue, anchor=north west] at ($(qatbox.north west)+(0.18,-0.13)$) {Stage I: Quantization-aware self-distillation};
+  \node[stage=bfblue, minimum width=112mm, minimum height=30mm, anchor=west] (distillbox) at (3.0,5.85) {};
+  \node[label=bfblue, anchor=north west] at ($(distillbox.north west)+(0.18,-0.13)$) {Stage I: Mean self-distillation};
   \roboticon{(5.65,5.44)}{bfblue}{Frozen BF16\\teacher}
   \roboticon{(11.95,5.44)}{fporange}{Trainable FP4\\student}
   % Snowflake-like mark makes the frozen-weight role visible without relying on text alone.
   \draw[bfblue, line width=.45pt] (6.34,4.83) -- (6.70,5.19) (6.34,5.19) -- (6.70,4.83) (6.52,4.77) -- (6.52,5.25);
   \draw[arrow] (prompts) -- (5.17,5.44);
   \draw[arrow] (6.12,5.44) -- node[above, font=\scriptsize] {$y$, top-$k$ logits} (11.48,5.44);
-  \node[font=\scriptsize] at (8.80,4.84) {$\mathcal{L}_{\mathrm{KD}}=T^2\!\sum_{t\in y}\mathrm{KL}(p_T\Vert p_S)$};
+  \node[font=\scriptsize] at (8.80,4.84) {$\mathcal{L}_{\mathrm{KD}}=\frac{T^2}{N_{\mathrm{valid}}}\!\sum_{b,t}m_{b,t}\,\mathrm{KL}_{\mathcal{K}_{b,t}}(\widetilde p_T\Vert\widetilde p_S)$};
 
   % Stage II: GRPO dataflow.
   \node[stage=rewardgreen, minimum width=172mm, minimum height=25mm, anchor=west] (grpo) at (0.1,2.85) {};
   \node[label=rewardgreen, anchor=north west] at ($(grpo.north west)+(0.18,-0.13)$) {Stage II: FP4 GRPO post-training};
-  \node[process=fporange, minimum width=30mm] (policy) at (2.65,2.58) {QAT-adapted\\FP4 policy $\pi_\theta$};
+  \node[process=fporange, minimum width=30mm] (policy) at (2.65,2.58) {FP4 policy after\\Mean self-distillation};
   \node[process=fporange, minimum width=30mm] (rollout) at (6.85,2.58) {Quantized rollouts\\$\{y_i\}_{i=1}^{G}$};
   \node[process=rewardgreen, minimum width=30mm] (reward) at (11.05,2.58) {Task rewards and\\group advantages};
   \node[process=rewardgreen, minimum width=24mm] (update) at (15.0,2.58) {Update policy\\with GRPO};

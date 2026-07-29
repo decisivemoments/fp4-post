@@ -4,7 +4,7 @@
 Example:
   python tools/plot_rollout_comparison.py \
     --run 'Direct FP4=outputs/grpo/model/direct_fp4/rollout_quality' \
-    --run 'QAT + moving mean=outputs/grpo/model/full/rollout_quality' \
+    --run 'Mean self-distillation=outputs/grpo/model/full/rollout_quality' \
     --run 'BF16=outputs/grpo/model/bf16/rollout_quality' \
     --output AuthorKit27/Figures/rollout_comparison
 """

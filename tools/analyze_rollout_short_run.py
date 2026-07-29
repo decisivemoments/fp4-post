@@ -13,7 +13,7 @@ from pathlib import Path
 
 
 COLORS = {"before": "#D55E00", "after": "#0072B2"}  # colour-blind safe
-LABELS = {"before": "Direct FP4 (before QAT)", "after": "QAT + moving mean"}
+LABELS = {"before": "Direct FP4", "after": "Mean self-distillation"}
 
 
 def read_jsonl(path: Path):
@@ -123,7 +123,7 @@ def main():
     parser.add_argument("--before", required=True,
                         help="Direct-FP4 output directory or its rollout_quality subdirectory")
     parser.add_argument("--after", required=True,
-                        help="QAT+moving-mean output directory or its rollout_quality subdirectory")
+                        help="Mean self-distillation output directory or its rollout_quality subdirectory")
     parser.add_argument("--model-label", required=True,
                         help="Used in filenames, e.g. qwen2_5_math_1_5b")
     parser.add_argument("--output-dir", default="AuthorKit27/Figures/rollout_short_runs")
@@ -149,10 +149,10 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = output_dir / args.model_label
     plot_time_series(before, after, "bad_ratio", "Bad completion ratio",
-                     "Rollout degeneration before and after QAT",
+                     "Direct FP4 vs. Mean self-distillation",
                      Path(f"{prefix}_bad_ratio"), args.max_steps)
     plot_time_series(before, after, "reward_mean", "Mean reward",
-                     "Reward signal before and after QAT",
+                     "Reward signal with Mean self-distillation",
                      Path(f"{prefix}_reward"), args.max_steps)
     counts, bad_count, total_count = load_bad_type_distribution(args.before, args.max_steps)
     plot_bad_type_distribution(counts, bad_count, total_count,

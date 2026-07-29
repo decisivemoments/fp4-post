@@ -17,7 +17,7 @@
 
 \setcounter{secnumdepth}{0}
 
-\title{From QAT to GRPO: A Two-Stage FP4 LLM Post-Training Pipeline with Causal Moving-Mean Quantization}
+\title{Mean Self-Distillation for GRPO: A Two-Stage LLM Post-Training Pipeline with Mean NVFP4}
 \author{Anonymous Submission}
 \affiliations{}
 
@@ -26,8 +26,8 @@
 \raggedbottom
 
 \begin{abstract}
-Low-precision training is attractive for large-language-model post-training, but reinforcement-learning-based post-training introduces a distinct failure mode: the policy must generate its own training data. We find that directly replacing the linear layers of a BF16 policy with an NVFP4 simulation can corrupt early rollouts through repetition, mixed-language fragments, and prematurely terminated responses. These failures reduce the reliability of group-relative reward signals and prevent stable policy optimization. We present a post-training pipeline that first adapts the quantized policy by self-distillation from its BF16 counterpart and then applies Group Relative Policy Optimization (GRPO) using a causal moving-mean residual quantization path. The implementation includes rollout-quality and distribution diagnostics that make generation failures measurable during training. Preliminary controlled runs show substantially lower rule-based bad-rollout rates and higher rewards after quantization-aware distillation than after direct FP4 GRPO.
-% The final version will report matched comparisons with BF16, direct FP4, Hadamard-based FP4, and the proposed QAT plus moving-mean configuration across Qwen2.5 0.5B, Qwen2.5-Math 1.5B, and Qwen2.5-Math 7B models.
+Low-precision training is attractive for large-language-model post-training, but reinforcement-learning-based post-training introduces a distinct failure mode: the policy must generate its own training data. We find that replacing the linear layers of a BF16 policy with an NVFP4 simulation can corrupt early rollouts through repetition, mixed-language fragments, and prematurely terminated responses. These failures reduce the reliability of group-relative reward signals and prevent stable policy optimization. We present a post-training pipeline that first adapts the quantized policy with Mean self-distillation and then applies Group Relative Policy Optimization (GRPO) using Mean NVFP4. The implementation includes rollout-quality and distribution diagnostics that make generation failures measurable during training, while the resulting low-precision policy is validated with actual NVFP4 inference. Preliminary controlled runs show substantially lower rule-based bad-rollout rates and higher rewards with Mean NVFP4 after Mean self-distillation than with NVFP4 GRPO.
+% The final version will report matched comparisons with BF16, NVFP4, Hadamard NVFP4, and Mean NVFP4 across Qwen2.5 0.5B, Qwen2.5-Math 1.5B, and Qwen2.5-Math 7B models.
 \end{abstract}
 
 \section{Introduction}
@@ -36,15 +36,15 @@ Post-training aligns a pretrained language model with task objectives through su
 
 RL post-training nevertheless poses a challenge that is absent from fixed-batch training and deployment-time quantization. The current policy is also a data generator: it produces candidate completions, which are scored and used to update that same policy. This closed loop amplifies small perturbations in the quantized forward path. A quantization error that only modestly changes logits can change a sampled completion, alter group-relative rewards, and shift the next policy update. The relevant question is therefore not only whether an FP4 model attains low loss on teacher-forced tokens, but whether it can generate the diverse, interpretable rollouts required to construct a useful RL learning signal.
 
-We study the following question: \emph{how can an FP4 policy be made reliable enough to generate the rollouts required for RL post-training?} Our starting observation is empirical and operational. Directly enabling the FP4 path for a BF16 policy before GRPO produces nonsensical repetitions, mixed-language fragments, and very short outputs early in training. The problem is not explained by visible numerical overflow: the diagnostic runs report no NaN or Inf events and stable activation-magnitude summaries. Instead, degraded decoding yields low-information groups of responses, weakening the relative-reward signal on which GRPO relies.
+We study the following question: \emph{how can an FP4 policy be made reliable enough to generate the rollouts required for RL post-training?} Our starting observation is empirical and operational. Enabling the NVFP4 path for a BF16 policy before GRPO produces nonsensical repetitions, mixed-language fragments, and very short outputs early in training. The problem is not explained by visible numerical overflow: the diagnostic runs report no NaN or Inf events and stable activation-magnitude summaries. Instead, degraded decoding yields low-information groups of responses, weakening the relative-reward signal on which GRPO relies.
 
-Our solution separates quantization adaptation from reward optimization. Before GRPO, a BF16 teacher samples responses and supplies response-token logits to an FP4 student. The student is optimized with a masked distillation objective on the same responses that define the teacher's decoding distribution. The adapted student then enters GRPO with the same quantized forward path. To preserve the benefit of mean-residual quantization during causal generation, we maintain a token-counted moving mean after prompt prefill and update it at each decode step. This two-stage design targets the source of the instability---the rollout distribution---before policy optimization can amplify it.
+Our solution separates low-precision adaptation from reward optimization. We call the first-stage method Mean self-distillation. Before GRPO, a BF16 teacher samples responses and supplies response-token logits to an FP4 student. The student is optimized with a masked distillation objective on the same responses that define the teacher's decoding distribution. The adapted student then enters GRPO with the same low-precision forward path. To preserve the benefit of Mean NVFP4 during causal generation, we maintain a token-counted activation mean after prompt prefill and update it at each decode step. This two-stage design targets the source of the instability---the rollout distribution---before policy optimization can amplify it.
 
 This work makes the following contributions:
 \begin{itemize}
-    \item a rollout-centric diagnosis of direct-FP4 GRPO failure, supported by quantitative text-quality and training-signal diagnostics;
-    \item a QAT self-distillation stage that adapts an FP4 policy before reward optimization;
-    \item a causal moving-mean residual FP4 implementation for both training and autoregressive decode; and
+    \item a rollout-centric diagnosis of NVFP4 GRPO failure, supported by quantitative text-quality and training-signal diagnostics;
+    \item Mean self-distillation, which adapts an FP4 policy to a BF16 teacher before reward optimization;
+    \item a Mean NVFP4 implementation for both training and autoregressive decode; and
     \item a matched evaluation protocol spanning mathematical reasoning and general reasoning benchmarks.
 \end{itemize}
 
@@ -52,17 +52,17 @@ This work makes the following contributions:
 
 \subsection{FP4 Quantized Training}
 
-Training with FP4 is challenging because blockwise scales must represent both rare high-magnitude values and the much denser bulk of a tensor. Metis attributes this difficulty to spectral anisotropy and uses structured decomposition to quantize narrower sub-distributions \citep{cao2025metis}. Averis identifies a coherent activation mean as an important source of outliers and quantizes a centered residual \citep{cao2026averis}. Other FP4-training systems combine mixed-precision optimization, differentiable quantization, and outlier compensation to stabilize large-scale pretraining \citep{wang2025optimizing,chmiel2025fp4}. NVIDIA's NVFP4 pretraining recipe combines random Hadamard transforms, two-dimensional quantization, stochastic rounding, and selective high-precision layers \citep{nvidia2025nvfp4}. In the post-training setting, QeRL combines NVFP4 weight quantization with LoRA and adaptive quantization noise to reduce rollout cost while optimizing reasoning policies \citep{huang2025qerl}.
+Training with FP4 is challenging because blockwise scales must represent both rare high-magnitude values and the much denser bulk of a tensor. Metis attributes this difficulty to spectral anisotropy and uses structured decomposition to quantize narrower sub-distributions \citep{cao2025metis}. Averis identifies a coherent activation mean as an important source of outliers and quantizes a centered residual \citep{cao2026averis}. Other FP4-training systems combine mixed-precision optimization, differentiable quantization, and outlier compensation to stabilize large-scale pretraining \citep{wang2025optimizing,chmiel2025fp4}. NVIDIA's Hadamard NVFP4 pretraining recipe combines random Hadamard transforms, two-dimensional quantization, stochastic rounding, and selective high-precision layers \citep{nvidia2025nvfp4}. In the post-training setting, QeRL combines NVFP4 weight quantization with LoRA and adaptive quantization noise to reduce rollout cost while optimizing reasoning policies \citep{huang2025qerl}.
 
 \subsection{Post-Training Quantization for LLM Inference}
 
 Post-training quantization (PTQ) converts a trained model using calibration data, without replaying its original optimization procedure. Early LLM PTQ work identified activation outliers as a central obstacle \citep{dettmers2022llmint8}; SmoothQuant shifts the activation-quantization burden into weights through an equivalent transformation \citep{xiao2023smoothquant}. Data-aware weight-only methods use approximate second-order information or activation-aware scaling to preserve important directions \citep{frantar2023gptq,lin2024awq}. Transformation-based methods reduce activation and weight outliers before quantization: QuaRot applies invariant rotations to hidden states, feed-forward activations, attention components, and KV caches \citep{ashkboos2024quarot}, whereas FlatQuant learns affine transformations that flatten layerwise weight and activation distributions \citep{sun2024flatquant}. OmniQuant instead learns clipping and equivalent transformations during calibration \citep{shao2024omniquant}. LLM-FP4 studies floating-point PTQ through format and clipping-range search together with per-channel activation scaling \citep{liu2023llmfp4}; QRazor instead retains salient bits from an integer representation to quantize weights, activations, and KV caches without additional training \citep{lee2025qrazor}. These methods target a fixed, deployment-time quantizer and inference accuracy. They do not address the coupled rollout-and-update process in which an RL policy generates the trajectories used for its own optimization.
 
-\subsection{Quantization-Aware Adaptation for Post-Training}
+\subsection{Low-Precision Adaptation and Distillation for Post-Training}
 
-Quantization-aware training (QAT) adapts a quantized forward path through fine-tuning, while quantization-aware distillation (QAD) further aligns a quantized student with a high-precision teacher. Classical QAT learns quantizer parameters directly against task loss \citep{esser2020lsq}, and knowledge distillation provides the standard teacher--student distribution-matching objective \citep{hinton2015distilling}. For LLMs, prior work has combined self-distillation with sub-4-bit QAT \citep{du2024bitdistiller}. NVIDIA recently introduced QAD for NVFP4 inference-accuracy recovery after complex post-training pipelines, including supervised fine-tuning and RL, using a KL-divergence objective between a full-precision teacher and a quantized student \citep{xin2026qad}. Its reported NVFP4 configurations retain selected Transformer modules and boundary layers in BF16, and the objective is post-hoc inference recovery rather than on-policy reward optimization. This line of work establishes distillation as a practical way to recover low-precision accuracy for post-trained models.
+Fine-tuning with a simulated low-precision forward path can adapt a model to quantization error. Classical learned-quantization methods optimize quantizer parameters directly against task loss \citep{esser2020lsq}, while knowledge distillation provides the standard teacher--student distribution-matching objective \citep{hinton2015distilling}. For LLMs, prior work has combined self-distillation with sub-4-bit low-precision adaptation \citep{du2024bitdistiller}. This line of work establishes teacher--student distribution matching as a practical way to recover low-precision accuracy for post-trained models.
 
-\paragraph{Motivation.} Taken together, existing FP4 training methods establish mechanisms for controlling quantization error during pretraining, and PTQ methods optimize a fixed model for inference. Quantization-aware adaptation recovers low-precision accuracy after a post-training pipeline, but it does not directly address the transition from a BF16 policy to an FP4 policy that must immediately generate on-policy trajectories. RL post-training instead couples quantization, decoding, reward construction, and policy updates in a single feedback loop. This setting motivates a rollout-centric FP4 pipeline: first adapt the quantized computation path to a stable teacher distribution, then optimize the adapted policy with RL while preserving a causal quantization state during decoding.
+\paragraph{Motivation.} Taken together, existing FP4 training methods establish mechanisms for controlling quantization error during pretraining, and PTQ methods optimize a fixed model for inference. Low-precision adaptation can recover accuracy after a post-training pipeline, but it does not directly address the transition from a BF16 policy to an NVFP4 policy that must immediately generate on-policy trajectories. RL post-training instead couples quantization, decoding, reward construction, and policy updates in a single feedback loop. This setting motivates a rollout-centric NVFP4 pipeline: first apply Mean self-distillation to adapt the low-precision computation path to a stable teacher distribution, then optimize the adapted policy with RL while preserving a causal quantization state during decoding.
 
 \section{Method}
 
@@ -70,12 +70,12 @@ Quantization-aware training (QAT) adapts a quantized forward path through fine-t
 
 For a prompt $x$, GRPO samples a group of completions $\{y_i\}_{i=1}^{G}$ from the current policy $\pi_\theta$. A task reward $r(x,y_i)$ is converted into a group-relative advantage, and the policy is updated with a clipped objective. Consequently, a useful optimization step presupposes that the sampled group contains interpretable responses with reward variation. If quantized decoding produces repeated or malformed text, relative comparisons can become noisy even when the reward function itself is correctly implemented.
 
-Figure~\ref{fig:pipeline} provides an overview of the proposed two-stage pipeline before the component details below. It first adapts an FP4 student to a BF16 teacher through quantization-aware self-distillation, then uses the adapted policy for GRPO with causal moving-mean residual quantization.
+Figure~\ref{fig:pipeline} provides an overview of the proposed two-stage pipeline before the component details below. It first adapts an FP4 student to a BF16 teacher through Mean self-distillation, then uses the adapted policy for GRPO with Mean NVFP4.
 
 \begin{figure*}[!t]
     \centering
     \includegraphics[width=\textwidth]{Figures/fp4_post_training_pipeline.pdf}
-    \caption{Overview of FP4 post-training. In Stage~I, the ice-blue teacher robot and snowflake denote frozen BF16 parameters, whereas the warm FP4 student robot is updated by masked token-level distillation. Stage~II uses the adapted FP4 policy to generate GRPO rollouts and updates it using group-relative rewards. The grid blocks visualize the fixed weight decomposition $U_r\Sigma_rV_r^\top+R_W$ and the mean-residual splits for activations and output gradients; only the residual matrices use FP4 quantization, and a causal moving-mean cache supplies the activation mean during autoregressive decoding.}
+    \caption{Overview of FP4 post-training. In Stage~I, the ice-blue teacher robot and snowflake denote frozen BF16 parameters, whereas the warm FP4 student robot is updated by masked token-level distillation. Stage~II uses the adapted Mean NVFP4 policy to generate GRPO rollouts and updates it using group-relative rewards. The grid blocks visualize the fixed weight decomposition $U_r\Sigma_rV_r^\top+R_W$ and the centered-residual decomposition used by Mean NVFP4 for activations and output gradients; only the residual matrices use FP4 quantization, and a causal activation-mean cache supplies the activation mean during autoregressive decoding.}
     \label{fig:pipeline}
 \end{figure*}
 
@@ -110,9 +110,9 @@ where $U_r\in\mathbb{R}^{d_{\mathrm{out}}\times r}$, $\Sigma_r\in\mathbb{R}^{r\t
 \end{equation}
 For a row-major activation matrix $X$, the corresponding forward GeMM is therefore $Y=\widehat X\widetilde W^{\top}+b$. Equivalently, the implementation first applies the quantized $V_r^{\top}$ projection, scales the rank-$r$ features by $\Sigma_r$, projects them with $U_r$, and adds the quantized residual branch. This form avoids forcing the dominant spectral component and the low-energy residual to share a single FP4 scale.
 
-\subsection{Causal Mean-Residual Quantization}
+\subsection{Mean NVFP4}
 
-The proposed condition uses mean--residual splitting for activations and output gradients. Let $X\in\mathbb{R}^{L\times d_{\mathrm{in}}}$ denote a flattened activation matrix, where $L$ merges batch and sequence positions. Following the mean-bias observation of Averis \citep{cao2026averis}, we isolate the feature-wise mean
+Mean NVFP4 centers activations and output gradients around their feature-wise means before quantizing the residuals. Let $X\in\mathbb{R}^{L\times d_{\mathrm{in}}}$ denote a flattened activation matrix, where $L$ merges batch and sequence positions. Following the mean-bias observation of Averis \citep{cao2026averis}, we isolate the feature-wise mean
 \begin{equation}
     \mu_X = \frac{1}{L}\mathbf{1}_L^{\top}X,
     \qquad
@@ -125,7 +125,7 @@ and apply FP4 only to the centered residual:
     = \mathbf{1}_L\mu_X+Q_{\mathrm{FP4}}(X_R).
     \label{eq:activation-qdq}
 \end{equation}
-Thus, the shared offset is restored in higher precision after the FP4 residual operation. Centering allocates the finite FP4 codebook to token-to-token variation rather than to a coherent rank-one offset. Although the implementation retains the generic Metis low-rank configuration interface, the moving-mean condition selects this mean-residual path for activations rather than computing an activation SVD at every step.
+Thus, Mean NVFP4 restores the shared offset in higher precision after quantizing the centered residual. Centering allocates the finite FP4 codebook to token-to-token variation rather than to a coherent rank-one offset. Although the implementation retains the generic Metis low-rank configuration interface, Mean NVFP4 selects this centered-residual path for activations rather than computing an activation SVD at every step.
 
 The backward output gradient is treated analogously. For $D=\partial\mathcal{L}/\partial Y\in\mathbb{R}^{L\times d_{\mathrm{out}}}$, define
 \begin{equation}
@@ -154,37 +154,56 @@ Expanding the reconstructed low-precision weight-gradient GeMM yields four terms
     \end{aligned}
     \label{eq:mean-gradient-identity}
 \end{equation}
-Equation~\ref{eq:mean-gradient-identity} is the form used by the FP4 implementation: it quantizes the residual streams, restores the mean components, and evaluates the resulting product without cancelling any term. Quantize--dequantize changes the residuals, and the causal activation mean and token masks need not match the gradient's reduction domain. The computation therefore retains the residual--residual interaction, both mean--residual interactions, and the rank-one mean--mean interaction.
+Equation~\ref{eq:mean-gradient-identity} is the form used by the Mean NVFP4 implementation: it quantizes the residual streams, restores the mean components, and evaluates the resulting product without cancelling any term. Quantize--dequantize changes the residuals, and the causal activation mean and token masks need not match the gradient's reduction domain. The computation therefore retains the residual--residual interaction, both cross interactions between means and residuals, and the rank-one mean--mean interaction.
 
 During prompt prefill, the method computes $\mu_X$ over all available prompt positions and stores both the mean and the number of represented token positions. At autoregressive decode step $t$, let $\mu_t$ be the mean of the newly observed positions and $n_t$ their count. The cache is updated as
 \begin{equation}
     \mu_{\mathrm{cache}} \leftarrow
     \frac{n_{\mathrm{cache}}\mu_{\mathrm{cache}}+n_t\mu_t}
     {n_{\mathrm{cache}}+n_t}.
-    \label{eq:moving-mean}
+    \label{eq:causal-mean-cache}
 \end{equation}
 At decode time, Eq.~\ref{eq:activation-qdq} uses $\mu_{\mathrm{cache}}$ in place of $\mu_X$. This construction does not access future generated tokens and therefore matches the information available to an autoregressive decoder. A full-sequence training forward and a prefix-only decode forward can nevertheless use different means; we discuss this inherent train--decode mismatch in the conclusion.
 
-\subsection{Quantization-Aware Self-Distillation Before GRPO}
+\subsection{Mean Self-Distillation Before GRPO}
 
-The proposed pipeline has two stages. First, a frozen BF16 teacher samples a response $y$ for each prompt $x$. The teacher and FP4 student then perform full forwards on the same concatenated sequence $(x,y)$. Let $p_T(\cdot\mid x,y_{<t})$ and $p_S(\cdot\mid x,y_{<t})$ be their temperature-scaled token distributions. We optimize only valid response positions:
+The proposed pipeline has two stages. First, a frozen BF16 teacher samples a response $y$ for each prompt $x$. The teacher and FP4 student then perform full forwards on the same concatenated sequence $(x,y)$. Let $z_{M,b,t,v}$ denote the next-token logit of model $M\in\{T,S\}$ for vocabulary item $v$ at response position $t$ in minibatch example $b$. We select the teacher's top-$k$ set and renormalize both models over that same set:
 \begin{equation}
-\mathcal{L}_{\mathrm{KD}}=T^2\sum_{t\in y}
-\mathrm{KL}\left(p_T(\cdot\mid x,y_{<t})\,\|\,p_S(\cdot\mid x,y_{<t})\right).
+\begin{aligned}
+\mathcal{K}_{b,t}
+&=\operatorname{TopK}_k\!\left(z_{T,b,t,\cdot}\right),\\
+\widetilde p_{M,b,t}(v)
+&=\frac{\exp(z_{M,b,t,v}/T)}
+{\sum_{u\in\mathcal{K}_{b,t}}\exp(z_{M,b,t,u}/T)},
+\quad v\in\mathcal{K}_{b,t}.
+\end{aligned}
 \end{equation}
 
-To reduce the memory cost of the teacher signal, we retain the teacher's top-$k$ logits and gather the corresponding vocabulary entries from the student. This stage adapts the quantized computation path to the teacher's response distribution before the policy is used to explore and optimize rewards. In the second stage, the resulting FP4 student is trained with GRPO on DeepMath-103K examples using a mathematical-equivalence reward.
+Let $m_{b,t}\in\{0,1\}$ indicate a valid response token and let $N_{\mathrm{valid}}=\sum_{b,t}m_{b,t}$. The implemented objective is
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{\mathrm{KD}}
+=\frac{T^2}{\max(N_{\mathrm{valid}},1)}
+\sum_{b,t}m_{b,t}
+\sum_{v\in\mathcal{K}_{b,t}}
+\widetilde p_{T,b,t}(v)
+\log\frac{\widetilde p_{T,b,t}(v)}
+{\widetilde p_{S,b,t}(v)}.
+\end{aligned}
+\label{eq:topk-distillation}
+\end{equation}
+By default, $k=100$. We retain only the teacher's top-$k$ logits and indices and gather the corresponding student logits. Both distributions are renormalized over the teacher-selected subset, and the loss is averaged over all valid response tokens in the minibatch. Mean self-distillation thereby adapts the low-precision computation path to the teacher's dominant response distribution before the policy is used to explore and optimize rewards. In the second stage, the resulting FP4 student is trained with GRPO on DeepMath-103K examples using a mathematical-equivalence reward.
 
 \begin{algorithm}[t]
-\caption{QAT Self-Distillation Followed by FP4 GRPO}
+\caption{Mean Self-Distillation Followed by FP4 GRPO}
 \begin{algorithmic}[1]
 \STATE Initialize BF16 teacher $\pi_T$ and FP4 student $\pi_S$ from the same base checkpoint.
-\FOR{each QAT minibatch of prompts $x$}
+\FOR{each Mean self-distillation minibatch of prompts $x$}
     \STATE Sample teacher responses $y\sim\pi_T(\cdot\mid x)$.
-    \STATE Update $\pi_S$ with masked token-level distillation loss $\mathcal{L}_{\mathrm{KD}}$.
+    \STATE Update $\pi_S$ with the masked, top-$k$-normalized distillation loss $\mathcal{L}_{\mathrm{KD}}$.
 \ENDFOR
 \FOR{each GRPO minibatch of prompts $x$}
-    \STATE Sample quantized rollouts $\{y_i\}_{i=1}^{G}$ from $\pi_S$ using the moving-mean cache.
+    \STATE Sample quantized rollouts $\{y_i\}_{i=1}^{G}$ from $\pi_S$ using the causal activation-mean cache of Mean NVFP4.
     \STATE Compute task rewards and group-relative advantages.
     \STATE Update $\pi_S$ with the GRPO objective.
 \ENDFOR
@@ -197,24 +216,24 @@ To reduce the memory cost of the teacher signal, we retain the teacher's top-$k$
 
 \subsection{Models, Data, and Baselines}
 
-The study post-trains Qwen2.5-0.5B-Instruct \citep{yang2024qwen25}, Qwen2.5-Math-1.5B-Base, and Qwen2.5-Math-7B-Base \citep{yang2024qwen25math} on DeepMath-103K \citep{he2025deepmath}, a collection of 103,022 challenging mathematical problems curated for RL and supervised fine-tuning. The dataset provides a verifiable final answer for each problem, enabling rule-based rewards, and is constructed through benchmark decontamination and difficulty filtering. We use its problem prompts and final answers for GRPO; the QAT stage uses teacher-generated responses on the same prompt distribution.
+The study post-trains Qwen2.5-0.5B-Instruct \citep{yang2024qwen25}, Qwen2.5-Math-1.5B-Base, and Qwen2.5-Math-7B-Base \citep{yang2024qwen25math} on DeepMath-103K \citep{he2025deepmath}, a collection of 103,022 challenging mathematical problems curated for RL and supervised fine-tuning. The dataset provides a verifiable final answer for each problem, enabling rule-based rewards, and is constructed through benchmark decontamination and difficulty filtering. We use its problem prompts and final answers for GRPO; Mean self-distillation uses teacher-generated responses on the same prompt distribution.
 
-The final matched comparison contains four conditions: (i) the pretrained checkpoint without post-training, (ii) BF16 GRPO, (iii) NV-Hadamard FP4 GRPO, and (iv) QAT plus moving-mean FP4 GRPO.
+The final matched comparison contains four conditions: (i) the pretrained checkpoint without post-training, (ii) BF16 GRPO, (iii) Hadamard NVFP4 GRPO, and (iv) Mean NVFP4 GRPO after Mean self-distillation.
 
-We use EvalScope to evaluate every reported checkpoint on AIME 2024, AIME 2025, AMC, MATH-500 \citep{lightman2023letsverify}, ARC \citep{clark2018arc}, and GPQA-Diamond \citep{rein2023gpqa}. Each prompt receives one greedy completion with \texttt{do\_sample=false},  and a maximum of 2048 newly generated tokens. We report the task accuracy produced by the corresponding EvalScope report.
+We use EvalScope to evaluate every reported checkpoint on AIME 2024, AIME 2025, AMC, MATH-500 \citep{lightman2023letsverify}, ARC \citep{clark2018arc}, and GPQA-Diamond \citep{rein2023gpqa}. Each prompt receives one greedy completion with \texttt{do\_sample=false},  and a maximum of 2048 newly generated tokens. For Mean NVFP4 checkpoints trained with Mean self-distillation, evaluation uses actual NVFP4 inference rather than only the simulated low-precision path used during training. We report the task accuracy produced by the corresponding EvalScope report.
 
 \subsection{Training Protocol}
 
-Table~\ref{tab:protocol} specifies the default Qwen2.5-0.5B-Instruct diagnostic configuration encoded by the training entry points. Matched comparisons use the same DeepMath-103K training split, reward implementation, prompt order, generation limits, and GRPO budget. Direct FP4 disables the weight-decomposition and activation/gradient residual paths. QAT plus moving mean uses rank-64 weight decomposition and mean bias activation/gradient residual paths.
+Table~\ref{tab:protocol} specifies the default Qwen2.5-0.5B-Instruct diagnostic configuration encoded by the training entry points. Matched comparisons use the same DeepMath-103K training split, reward implementation, prompt order, generation limits, and GRPO budget. NVFP4 disables the weight-decomposition and activation/gradient residual paths. Mean NVFP4 uses rank-64 weight decomposition and centers activations and output gradients before quantizing their residuals.
 
 \begin{table*}[!t]
 \centering
 \small
-\caption{Default controlled diagnostic protocol for Qwen2.5-0.5B-Instruct. QAT and GRPO step budgets are set explicitly for each reported run.}
+\caption{Default controlled diagnostic protocol for Qwen2.5-0.5B-Instruct. Mean self-distillation and GRPO step budgets are set explicitly for each reported run.}
 \label{tab:protocol}
 \begin{tabular}{@{}p{0.17\textwidth}p{0.37\textwidth}p{0.37\textwidth}@{}}
 \toprule
-Setting & QAT self-distillation & GRPO post-training \\
+Setting & Mean self-distillation & GRPO post-training \\
 \midrule
 Data & \multicolumn{2}{l}{DeepMath-103K training split; identical prompt order within each seed} \\
 Precision & BF16 teacher; FP4 student forward/backward & BF16 master parameters; FP4 policy forward/backward \\
@@ -223,7 +242,7 @@ Sequence limits & prompt 512; teacher generation 1024 & prompt 1024; completion 
 Optimization & AdamW, learning rate $10^{-6}$, 5\% warmup, gradient norm 1.0 & AdamW, learning rate $10^{-6}$, gradient norm 1.0 \\
 Distillation & $T=1$, one teacher response/prompt, top-$k=100$ & group-relative accuracy reward \\
 Generation & --- & cache enabled; gradient checkpointing enabled \\
-FP4 operator & moving-mean residual, according to condition & same operator as the corresponding condition \\
+NVFP4 condition & Mean NVFP4 & NVFP4, Hadamard NVFP4, or Mean NVFP4 \\
 Residual ranks & weight: 64 when enabled & weight: 64 when enabled \\
 \bottomrule
 \end{tabular}
@@ -235,28 +254,28 @@ Scalar benchmark accuracy is insufficient to explain why a post-training run suc
 
 \section{Results}
 
-\subsection{QAT Stabilizes FP4 Rollouts Before GRPO}
-\label{sec:qat-analysis}
+\subsection{Mean Self-Distillation Stabilizes FP4 Rollouts Before GRPO}
+\label{sec:mean-self-distillation-analysis}
 
-We first ask whether a BF16 policy can be used directly under the FP4 execution path to generate the trajectories required by GRPO. Figure~\ref{fig:direct-fp4-bad-types} decomposes the direct-FP4 failures behind the aggregate bad-rollout rate. Low lexical diversity and explicit token loops account for a large fraction of flagged completions, with short outputs and mixed-language generations providing additional evidence of decoding degradation. Because the categories are assigned independently, their proportions need not sum to one. This decomposition is important: it distinguishes a high bad-rollout rate caused by visible generation failures from a mere change in task difficulty or reward calibration.
+We first ask whether a BF16 policy can be used under the NVFP4 execution path to generate the trajectories required by GRPO. Figure~\ref{fig:nvfp4-bad-types} decomposes the NVFP4 failures behind the aggregate bad-rollout rate. Low lexical diversity and explicit token loops account for a large fraction of flagged completions, with short outputs and mixed-language generations providing additional evidence of decoding degradation. Because the categories are assigned independently, their proportions need not sum to one. This decomposition is important: it distinguishes a high bad-rollout rate caused by visible generation failures from a mere change in task difficulty or reward calibration.
 
 \begin{figure}[!t]
     \centering
     \includegraphics[width=0.92\linewidth]{Figures/direct_fp4_bad_types_qwen_0_5b.pdf}
-    \caption{Multi-label composition of direct-FP4 bad rollouts for Qwen2.5-0.5B-Instruct. A completion can receive more than one failure label.}
-    \label{fig:direct-fp4-bad-types}
+    \caption{Multi-label composition of NVFP4 bad rollouts for Qwen2.5-0.5B-Instruct. A completion can receive more than one failure label.}
+    \label{fig:nvfp4-bad-types}
 \end{figure}
 
-Figure~\ref{fig:bad-rollout-trajectory} compares the bad-rollout rate of direct FP4 GRPO and QAT plus moving-mean FP4 on the available Qwen2.5-0.5B-Instruct diagnostic run. Direct FP4 has a consistently higher bad-rollout rate, whereas QAT pre-adaptation substantially reduces this rate throughout the observed training trajectory.
+Figure~\ref{fig:bad-rollout-trajectory} compares the bad-rollout rate of NVFP4 GRPO and Mean NVFP4 GRPO after Mean self-distillation on the available Qwen2.5-0.5B-Instruct diagnostic run. NVFP4 has a consistently higher bad-rollout rate, whereas Mean NVFP4 substantially reduces this rate throughout the observed training trajectory.
 
 \begin{figure}[!t]
     \centering
     \includegraphics[width=\linewidth]{Figures/rollout_bad_ratio_qwen_0_5b.pdf}
-    \caption{Bad-rollout-rate trajectories for Qwen2.5-0.5B-Instruct. Direct FP4 is compared with QAT plus moving-mean FP4 over the logged GRPO steps. Pale traces are logged values and solid traces are trailing moving averages.}
+    \caption{Bad-rollout-rate trajectories for Qwen2.5-0.5B-Instruct. NVFP4 is compared with Mean NVFP4 after Mean self-distillation over the logged GRPO steps. Pale traces are logged values and solid traces are trailing averages.}
     \label{fig:bad-rollout-trajectory}
 \end{figure}
 
-Figure~\ref{fig:reward-trajectory} shows the corresponding TensorBoard \texttt{train/reward} signal. It remains low for direct FP4 but rises to a materially higher level after QAT. Together, the two trajectories support the proposed ordering of the pipeline: adapt the quantized policy before using its samples for reward optimization.
+Figure~\ref{fig:reward-trajectory} shows the corresponding TensorBoard \texttt{train/reward} signal. It remains low for NVFP4 but rises to a materially higher level with Mean NVFP4 after Mean self-distillation. Together, the two trajectories support the proposed ordering of the pipeline: adapt the low-precision policy before using its samples for reward optimization.
 
 \begin{figure}[!t]
     \centering
@@ -267,7 +286,7 @@ Figure~\ref{fig:reward-trajectory} shows the corresponding TensorBoard \texttt{t
 
 \subsection{Main Results}
 
-Table~\ref{tab:main} summarizes the downstream comparison across model scales and task families. QAT with moving-mean quantization enables substantial post-training gains for the math-specialized models. Relative to their pretrained checkpoints, the QAT policies improve the 1.5B and 7B models by large margins on AMC, MATH-500, ARC, and GPQA-Diamond; the 7B policy also improves both AIME evaluations. The QAT policies remain close to their BF16-GRPO counterparts on most mathematical tasks. For the 1.5B model, the largest gap is 6.0 points on AMC, while MATH-500 differs by only 2.4 points and ARC is slightly higher under QAT. For the 7B model, QAT matches BF16 on MATH-500 and exceeds it on AIME24, AIME25, and AMC. The principal exception is ARC, where the 7B QAT policy trails BF16 by 18.5 points.
+Table~\ref{tab:main} summarizes the downstream comparison across model scales and task families. Mean NVFP4 after Mean self-distillation enables substantial post-training gains for the math-specialized models. Relative to their pretrained checkpoints, the Mean NVFP4 policies improve the 1.5B and 7B models by large margins on AMC, MATH-500, ARC, and GPQA-Diamond; the 7B policy also improves both AIME evaluations. These policies remain close to their BF16-GRPO counterparts on most mathematical tasks. For the 1.5B model, the largest gap is 6.0 points on AMC, while MATH-500 differs by only 2.4 points and ARC is slightly higher under Mean NVFP4. For the 7B model, Mean NVFP4 matches BF16 on MATH-500 and exceeds it on AIME24, AIME25, and AMC. The principal exception is ARC, where the 7B Mean NVFP4 policy trails BF16 by 18.5 points.
 
 \begin{table*}[!t]
 \centering
@@ -280,25 +299,25 @@ Model & Method & AIME24 & AIME25 & AMC & MATH-500 & ARC & GPQA-Diamond \\
 \midrule
 Qwen2.5-0.5B & Pretrained & 0.0 & 0.0 & 6.72 & 29.6 & 54.62 & 18.69 \\
 & BF16 GRPO & 3.3 & 0.0 & 8.95 & 32.2 & 53.22 & 24.24 \\
-& NV-Hadamard GRPO & -- & -- & -- & -- & -- & -- \\
-& QAT + moving mean & 0.0 & 0.0 & 6.72 & 6 & 29.6 & 24.24 \\
+& Hadamard NVFP4 GRPO & -- & -- & -- & -- & -- & -- \\
+& Mean NVFP4 GRPO & 0.0 & 0.0 & 6.72 & 6 & 29.6 & 24.24 \\
 \midrule
 Qwen2.5-Math-1.5B-Base & Pretrained & 6.67 & 10.0 & 20.15 & 25.8 & 7.89 & 0.51 \\
 & BF16 GRPO & 13.3 & 3.3 & 38.8 & 70.4 & 61.61 & 22.73 \\
-& NV-Hadamard GRPO & -- & -- & -- & -- & -- & -- \\
-& QAT + moving mean & 10.0 & 6.67 & 32.8 & 68.0 & 63.39 & 19.7 \\
+& Hadamard NVFP4 GRPO & -- & -- & -- & -- & -- & -- \\
+& Mean NVFP4 GRPO & 10.0 & 6.67 & 32.8 & 68.0 & 63.39 & 19.7 \\
 \midrule
 Qwen2.5-Math-7B-Base & Pretrained & 6.67 & 3.3 & 5.97 & 17.4 & 15.53 & 8.59 \\
 & BF16 GRPO & 10.0 & 3.3 & 46.27 & 78.0 & 78.52 & 33.84 \\
-& NV-Hadamard GRPO & -- & -- & -- & -- & -- & -- \\
-& QAT + moving mean & 13.3 & 13.3 & 50.74 & 78.0 & 60.07 & 31.31 \\
+& Hadamard NVFP4 GRPO & -- & -- & -- & -- & -- & -- \\
+& Mean NVFP4 GRPO & 13.3 & 13.3 & 50.74 & 78.0 & 60.07 & 31.31 \\
 \bottomrule
 \end{tabular}
 \end{table*}
 
 \FloatBarrier
 
-The 0.5B instruction model exhibits a different regime: QAT does not retain the BF16 gains on MATH-500 or ARC and falls below its pretrained score on both tasks. Taken together, the results show that the proposed pipeline can preserve strong reasoning performance at FP4 for math-specialized backbones, while robustness remains sensitive to model scale and task family.
+The 0.5B instruction model exhibits a different regime: Mean NVFP4 after Mean self-distillation does not retain the BF16 gains on MATH-500 or ARC and falls below its pretrained score on both tasks. Taken together, the results show that the proposed pipeline can preserve strong reasoning performance with Mean NVFP4 for math-specialized backbones, while robustness remains sensitive to model scale and task family.
 
 \begin{table}[!t]
 \centering
@@ -310,16 +329,16 @@ The 0.5B instruction model exhibits a different regime: QAT does not retain the 
 Model & Method & Start $r$ & Final $r$ \\
 \midrule
 Qwen2.5-0.5B & BF16 GRPO & 0.1130 & 0.3066 \\
-Qwen2.5-0.5B & Direct FP4 GRPO & 0.0200 & 0.0398 \\
-Qwen2.5-0.5B & QAT + moving mean & 0.0100 & 0.2316 \\
+Qwen2.5-0.5B & NVFP4 GRPO & 0.0200 & 0.0398 \\
+Qwen2.5-0.5B & Mean NVFP4 GRPO & 0.0100 & 0.2316 \\
 \midrule
 Qwen2.5-Math-1.5B-Base & BF16 GRPO & 0.3750 & 0.4378 \\
-Qwen2.5-Math-1.5B-Base & Direct FP4 GRPO & 0.0820 & 0.0191 \\
-Qwen2.5-Math-1.5B-Base & QAT + moving mean & 0.0664 & 0.4023 \\
+Qwen2.5-Math-1.5B-Base & NVFP4 GRPO & 0.0820 & 0.0191 \\
+Qwen2.5-Math-1.5B-Base & Mean NVFP4 GRPO & 0.0664 & 0.4023 \\
 \midrule
 Qwen2.5-Math-7B-Base & BF16 GRPO & 0.1992 & 0.4448 \\
-Qwen2.5-Math-7B-Base & Direct FP4 GRPO & 0.1641 & 0.2949 \\
-Qwen2.5-Math-7B-Base & QAT + moving mean & 0.1660 & 0.3379 \\
+Qwen2.5-Math-7B-Base & NVFP4 GRPO & 0.1641 & 0.2949 \\
+Qwen2.5-Math-7B-Base & Mean NVFP4 GRPO & 0.1660 & 0.3379 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -328,19 +347,19 @@ Qwen2.5-Math-7B-Base & QAT + moving mean & 0.1660 & 0.3379 \\
 
 \paragraph{Training-Signal Comparison.} Table~\ref{tab:reward} reports the first and final logged GRPO rewards for each model and precision condition. These endpoints expose whether the policy obtains a useful learning signal under the FP4 rollout path.
 
-Direct FP4 produces the weakest final reward at every scale. Its failure is most pronounced at 0.5B and 1.5B: reward rises only from 0.0200 to 0.0398 for the former and falls from 0.0820 to 0.0191 for the latter. QAT plus moving mean changes this behavior. It raises the 0.5B reward to 0.2316 and the 1.5B reward to 0.4023, approaching the corresponding BF16 values of 0.3066 and 0.4378. At 7B, both FP4 variants improve during GRPO, but QAT plus moving mean finishes higher than direct FP4 (0.3379 versus 0.2949), while BF16 remains highest at 0.4448. The improvement is therefore not simply a consequence of a favorable starting reward: the two FP4 conditions begin at comparable levels for the 0.5B and 7B models, whereas their final rewards separate after training. Combined with the rollout diagnostics, this pattern supports QAT as an effective preparation step for obtaining a usable FP4 GRPO learning signal.
+NVFP4 produces the weakest final reward at every scale. Its failure is most pronounced at 0.5B and 1.5B: reward rises only from 0.0200 to 0.0398 for the former and falls from 0.0820 to 0.0191 for the latter. Mean NVFP4 after Mean self-distillation changes this behavior. It raises the 0.5B reward to 0.2316 and the 1.5B reward to 0.4023, approaching the corresponding BF16 values of 0.3066 and 0.4378. At 7B, both NVFP4 variants improve during GRPO, but Mean NVFP4 finishes higher than NVFP4 (0.3379 versus 0.2949), while BF16 remains highest at 0.4448. The improvement is therefore not simply a consequence of a favorable starting reward: the two NVFP4 conditions begin at comparable levels for the 0.5B and 7B models, whereas their final rewards separate after training. Combined with the rollout diagnostics, this pattern supports Mean self-distillation as an effective preparation step for obtaining a usable Mean NVFP4 GRPO learning signal.
 
 \subsection{Empirical Takeaway}
 
-The results form a consistent picture of FP4 post-training. Direct FP4 degrades rollout quality and yields the weakest final reward across all three model scales, demonstrating that low-precision execution can disrupt the on-policy data on which GRPO depends. QAT self-distillation addresses this failure before reward optimization: it substantially improves the FP4 reward trajectory and enables strong downstream reasoning performance for the math-specialized 1.5B and 7B models. The remaining gap on selected tasks, most clearly ARC for the 7B model and MATH-500 for the 0.5B instruction model, identifies robustness across model families as the central challenge for FP4 post-training.
+The results form a consistent picture of FP4 post-training. NVFP4 degrades rollout quality and yields the weakest final reward across all three model scales, demonstrating that low-precision execution can disrupt the on-policy data on which GRPO depends. Mean NVFP4, prepared through Mean self-distillation, addresses this failure before reward optimization: it substantially improves the NVFP4 reward trajectory and enables strong downstream reasoning performance for the math-specialized 1.5B and 7B models. The remaining gap on selected tasks, most clearly ARC for the 7B model and MATH-500 for the 0.5B instruction model, identifies robustness across model families as the central challenge for FP4 post-training.
 
 \section{Conclusion}
 
-FP4 post-training cannot be evaluated solely as a low-precision optimization problem because an RL policy generates the trajectories from which it learns. We presented a two-stage FP4 pipeline that first adapts a quantized student to a BF16 teacher through masked self-distillation and then applies GRPO with causal moving-mean residual quantization. This ordering targets the rollout distribution before reward optimization closes the feedback loop.
+FP4 post-training cannot be evaluated solely as a low-precision optimization problem because an RL policy generates the trajectories from which it learns. We presented a two-stage FP4 pipeline that first adapts a low-precision student to a BF16 teacher through Mean self-distillation and then applies GRPO with Mean NVFP4. This ordering targets the rollout distribution before reward optimization closes the feedback loop.
 
-Across three model scales, direct FP4 produces degraded rollout quality and the weakest final reward. QAT plus moving mean substantially improves the FP4 learning signal and preserves strong downstream reasoning performance for the 1.5B and 7B math-specialized models. These findings establish rollout quality as a central criterion for FP4 RL post-training: a quantized policy must generate usable candidate groups, not merely execute low-precision matrix multiplications on a fixed batch.
+Across three model scales, NVFP4 produces degraded rollout quality and the weakest final reward. Mean NVFP4 after Mean self-distillation substantially improves the NVFP4 learning signal and preserves strong downstream reasoning performance for the 1.5B and 7B math-specialized models. These findings establish rollout quality as a central criterion for FP4 RL post-training: a low-precision policy must generate usable candidate groups, not merely execute low-precision matrix multiplications on a fixed batch.
 
-The remaining challenges clarify the scope of the approach. The causal moving-mean cache can differ from a full-sequence training forward, and the rule-based rollout classifier captures visible degeneration rather than every form of semantic failure. Moreover, the ARC and 0.5B results show that stable FP4 optimization does not guarantee uniform accuracy across all model families and tasks. Reporting the complete quantization recipe, decoding configuration, hardware and software environment, and seed-level variation is therefore essential for reproducible FP4 post-training research.
+The remaining challenges clarify the scope of the approach. The causal activation-mean cache used by Mean NVFP4 can differ from a full-sequence training forward, and the rule-based rollout classifier captures visible degeneration rather than every form of semantic failure. Moreover, the ARC and 0.5B results show that stable FP4 optimization does not guarantee uniform accuracy across all model families and tasks. Reporting the complete quantization recipe, decoding configuration, hardware and software environment, and seed-level variation is therefore essential for reproducible FP4 post-training research.
 
 \bibliography{fp4_post_aaai_draft}
 \end{document}
