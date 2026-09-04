@@ -19,6 +19,11 @@ from transformer_engine.pytorch.tensor.storage.nvfp4_tensor_storage import (
     NVFP4TensorStorage,
 )
 
+from .centered_nvfp4 import (
+    fused_mean_and_quantize_centered_rowwise,
+    quantize_centered_rowwise,
+)
+
 
 NVFP4_BLOCK_SIZE = 16
 # TE 2.15's SM120 native Wgrad path needs the reduction dimension aligned
@@ -178,6 +183,7 @@ class PackedMeanActivation:
         value: torch.Tensor,
         *,
         columnwise: bool = True,
+        pack_backend: str = "te",
     ) -> "PackedMeanActivation":
         flat = value.reshape(-1, value.shape[-1]).contiguous()
         rows, columns = flat.shape
@@ -185,24 +191,44 @@ class PackedMeanActivation:
         packed_rows *= NVFP4_WGRAD_ROW_ALIGNMENT
         _validate_native_shape(packed_rows, columns, label="activation")
         with _native_profile_range("native_nvfp4.activation_mean_and_pack"):
-            with _native_profile_range("native_nvfp4.activation_mean"):
-                mean = flat.mean(dim=0, keepdim=True)
-            with _native_profile_range(
-                "native_nvfp4.activation_center_and_pack"
-            ):
-                residual = (flat - mean).contiguous()
-                if packed_rows != rows:
-                    residual = F.pad(
-                        residual,
-                        (0, 0, 0, packed_rows - rows),
+            quantizer = _get_quantizer(
+                value.device,
+                stochastic_rounding=False,
+                rowwise=True,
+                columnwise=columnwise,
+            )
+            if pack_backend == "te":
+                with _native_profile_range("native_nvfp4.activation_mean"):
+                    mean = flat.mean(dim=0, keepdim=True)
+                with _native_profile_range("native_nvfp4.activation_center_and_pack"):
+                    residual = (flat - mean).contiguous()
+                    if packed_rows != rows:
+                        residual = F.pad(
+                            residual,
+                            (0, 0, 0, packed_rows - rows),
+                        )
+                    quantized = quantizer.quantize(residual)
+            elif pack_backend == "centered_cuda":
+                if columnwise:
+                    raise ValueError(
+                        "centered_cuda is rowwise-only and inference-only"
                     )
-                quantizer = _get_quantizer(
-                    value.device,
-                    stochastic_rounding=False,
-                    rowwise=True,
-                    columnwise=columnwise,
-                )
-                quantized = quantizer.quantize(residual)
+                if packed_rows != rows:
+                    raise ValueError(
+                        "centered_cuda v1 does not support activation padding"
+                    )
+                with _native_profile_range(
+                    "native_nvfp4.activation_fused_mean_and_amax"
+                ):
+                    with _native_profile_range(
+                        "native_nvfp4.activation_centered_cuda_pack"
+                    ):
+                        mean, quantized = fused_mean_and_quantize_centered_rowwise(
+                            flat,
+                            quantizer,
+                        )
+            else:
+                raise ValueError(f"Unknown activation pack backend: {pack_backend}")
         return cls(
             mean=mean,
             quantized_residual=quantized,
@@ -232,9 +258,16 @@ class PackedMeanActivation:
 class NativeActivationGroup:
     """Weak-reference cache for Q/K/V and Gate/Up activation packing."""
 
-    def __init__(self, name: str, *, columnwise: bool = True) -> None:
+    def __init__(
+        self,
+        name: str,
+        *,
+        columnwise: bool = True,
+        pack_backend: str = "te",
+    ) -> None:
         self.name = name
         self.columnwise = columnwise
+        self.pack_backend = pack_backend
         self._source_ref: Optional[weakref.ReferenceType] = None
         self._packed: Optional[PackedMeanActivation] = None
 
@@ -251,6 +284,7 @@ class NativeActivationGroup:
         packed = PackedMeanActivation.from_tensor(
             value,
             columnwise=self.columnwise,
+            pack_backend=self.pack_backend,
         )
 
         def clear_cached_input(ref) -> None:
@@ -389,7 +423,9 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
         packed_activation: PackedMeanActivation,
         packed_residual_weight: PackedNVFP4Weight,
         packed_v_weight: PackedNVFP4Weight,
+        packed_u_weight: Optional[PackedNVFP4Weight],
         stochastic_rounding: bool,
+        lowrank_compute: str,
     ) -> torch.Tensor:
         input_shape = tuple(input_.shape)
         residual_output = _native_mean_fprop(
@@ -400,16 +436,49 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
             packed_activation,
             packed_v_weight,
         )
-        with _native_profile_range("native_nvfp4.lowrank_fprop_bf16"):
+        with _native_profile_range("native_nvfp4.lowrank_scale_bf16"):
             scaled_v_output = v_output * singular_values
-            # Accumulate in-place: out-of-place torch.addmm copies its input
-            # C matrix before invoking GEMM, which was a 1.655 ms DtoD copy
-            # for Qwen-0.5B up_proj at M=65536, N=8960. residual_output is a
-            # forward-only temporary and is not needed by this Function's
-            # backward implementation.
-            with _native_profile_range("native_nvfp4.lowrank_addmm_inplace"):
-                residual_output.addmm_(scaled_v_output, u_weight.T)
-            output = residual_output
+        if lowrank_compute == "bf16":
+            with _native_profile_range("native_nvfp4.lowrank_fprop_bf16"):
+                # Accumulate in-place: out-of-place torch.addmm copies its
+                # input C matrix before invoking GEMM. residual_output is a
+                # forward-only temporary and is not used by this Function's
+                # backward implementation.
+                with _native_profile_range(
+                    "native_nvfp4.lowrank_addmm_inplace"
+                ):
+                    residual_output.addmm_(scaled_v_output, u_weight.T)
+                output = residual_output
+        elif lowrank_compute == "nvfp4":
+            if packed_u_weight is None:
+                raise RuntimeError("NVFP4 low-rank path requires packed U")
+            with _native_profile_range("native_nvfp4.lowrank_scaled_v_pack"):
+                scaled_v_quantizer = _get_quantizer(
+                    scaled_v_output.device,
+                    stochastic_rounding=False,
+                    rowwise=True,
+                    columnwise=False,
+                )
+                packed_scaled_v = scaled_v_quantizer.quantize(
+                    scaled_v_output
+                )
+            with _native_profile_range("native_nvfp4.lowrank_nvfp4_gemm"):
+                # Write directly into residual_output with beta=1, avoiding a
+                # separate MxN BF16 output add. U and scaled_v are separately
+                # quantized; singular values are intentionally not folded U.
+                output = general_gemm(
+                    packed_u_weight.quantized,
+                    packed_scaled_v,
+                    out_dtype=torch.bfloat16,
+                    layout="TN",
+                    out=residual_output,
+                    beta=1.0,
+                    accumulate=True,
+                )[0]
+                if output is None:
+                    output = residual_output
+        else:
+            raise ValueError(f"Unsupported low-rank compute mode: {lowrank_compute}")
         if bias is not None:
             with _native_profile_range("native_nvfp4.fprop_bias_add"):
                 output = output + bias
@@ -466,6 +535,8 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -483,6 +554,8 @@ class NativeFullNVFP4Linear(nn.Module):
         dtype: torch.dtype = torch.bfloat16,
         stochastic_rounding: bool = True,
         activation_columnwise: bool = True,
+        activation_pack_backend: str = "te",
+        lowrank_compute: str = "bf16",
     ) -> None:
         super().__init__()
         require_native_nvfp4()
@@ -492,6 +565,18 @@ class NativeFullNVFP4Linear(nn.Module):
             raise ValueError(
                 f"rank must be in [1, {min(in_features, out_features)}], got {rank}"
             )
+        if lowrank_compute not in {"bf16", "nvfp4"}:
+            raise ValueError(
+                "lowrank_compute must be either 'bf16' or 'nvfp4'"
+            )
+        if activation_pack_backend not in {"te", "centered_cuda"}:
+            raise ValueError(
+                "activation_pack_backend must be 'te' or 'centered_cuda'"
+            )
+        if activation_pack_backend == "centered_cuda" and activation_columnwise:
+            raise ValueError(
+                "centered_cuda activation packing is rowwise-only"
+            )
         _validate_native_shape(out_features, in_features, label="weight")
         _validate_native_shape(rank, in_features, label="V weight")
 
@@ -499,6 +584,7 @@ class NativeFullNVFP4Linear(nn.Module):
         self.out_features = out_features
         self.rank = rank
         self.stochastic_rounding = stochastic_rounding
+        self.lowrank_compute = lowrank_compute
         self.residual_weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
@@ -519,6 +605,7 @@ class NativeFullNVFP4Linear(nn.Module):
         self.activation_group = NativeActivationGroup(
             "unshared",
             columnwise=activation_columnwise,
+            pack_backend=activation_pack_backend,
         )
         self.layer_name = ""
         self._weight_cache: dict[str, tuple[tuple, PackedNVFP4Weight]] = {}
@@ -542,6 +629,8 @@ class NativeFullNVFP4Linear(nn.Module):
         rank: int = 64,
         stochastic_rounding: bool = True,
         activation_columnwise: bool = True,
+        activation_pack_backend: str = "te",
+        lowrank_compute: str = "bf16",
     ) -> "NativeFullNVFP4Linear":
         module = cls(
             linear.in_features,
@@ -552,6 +641,8 @@ class NativeFullNVFP4Linear(nn.Module):
             dtype=linear.weight.dtype,
             stochastic_rounding=stochastic_rounding,
             activation_columnwise=activation_columnwise,
+            activation_pack_backend=activation_pack_backend,
+            lowrank_compute=lowrank_compute,
         )
         weight_fp32 = linear.weight.detach().to(torch.float32)
         u, singular_values, vh = torch.linalg.svd(
@@ -607,6 +698,11 @@ class NativeFullNVFP4Linear(nn.Module):
         return super()._apply(fn, recurse=recurse)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.lowrank_compute == "nvfp4" and torch.is_grad_enabled():
+            raise RuntimeError(
+                "lowrank_compute='nvfp4' is inference-only; use "
+                "torch.inference_mode() or select lowrank_compute='bf16'"
+            )
         if input_.dtype != torch.bfloat16:
             input_ = input_.to(torch.bfloat16)
         packed_activation = self.activation_group.get(input_)
@@ -615,6 +711,11 @@ class NativeFullNVFP4Linear(nn.Module):
             self.residual_weight,
         )
         packed_v = self._get_packed_weight("v", self.v_weight)
+        packed_u = (
+            self._get_packed_weight("u", self.u_weight)
+            if self.lowrank_compute == "nvfp4"
+            else None
+        )
         return _NativeFullNVFP4Function.apply(
             input_,
             self.residual_weight,
@@ -625,7 +726,9 @@ class NativeFullNVFP4Linear(nn.Module):
             packed_activation,
             packed_residual,
             packed_v,
+            packed_u,
             self.stochastic_rounding,
+            self.lowrank_compute,
         )
 
     @torch.no_grad()
@@ -637,7 +740,8 @@ class NativeFullNVFP4Linear(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
-            f"rank={self.rank}, native_nvfp4=True"
+            f"rank={self.rank}, native_nvfp4=True, "
+            f"lowrank_compute={self.lowrank_compute}"
         )
 
 
@@ -648,6 +752,8 @@ def replace_linear_with_native_full_nvfp4(
     target_modules: Optional[Iterable[str]] = None,
     stochastic_rounding: bool = True,
     activation_columnwise: bool = True,
+    activation_pack_backend: str = "te",
+    lowrank_compute: str = "bf16",
 ) -> list[str]:
     """Replace selected Qwen projections and return their fully qualified names."""
     targets = set(target_modules or DEFAULT_TARGET_MODULES)
@@ -666,6 +772,8 @@ def replace_linear_with_native_full_nvfp4(
             rank=rank,
             stochastic_rounding=stochastic_rounding,
             activation_columnwise=activation_columnwise,
+            activation_pack_backend=activation_pack_backend,
+            lowrank_compute=lowrank_compute,
         )
         native_layer.layer_name = name
 
@@ -680,6 +788,7 @@ def replace_linear_with_native_full_nvfp4(
             NativeActivationGroup(
                 group_name,
                 columnwise=activation_columnwise,
+                pack_backend=activation_pack_backend,
             ),
         )
 

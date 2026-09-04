@@ -62,6 +62,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--seq-length", type=int, default=512)
     parser.add_argument("--layer-index", type=int, default=0)
     parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument(
+        "--lowrank-compute",
+        choices=("bf16", "nvfp4"),
+        default="bf16",
+        help="Low-rank U @ scaled_v implementation for native NVFP4 inference.",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--device", default="cuda:0")
@@ -87,6 +93,22 @@ def arguments() -> argparse.Namespace:
             "full emits rowwise and columnwise NVFP4 activation layouts; "
             "rowwise is an inference-only experiment that omits the "
             "backward-only columnwise layout."
+        ),
+    )
+    parser.add_argument(
+        "--activation-pack-backend",
+        choices=("te", "centered_cuda"),
+        default="te",
+        help="TE reference pack or the project-local centered CUDA pack.",
+    )
+    parser.add_argument(
+        "--activation-pack-backends",
+        nargs="+",
+        choices=("te", "centered_cuda"),
+        help=(
+            "Benchmark multiple NVFP4 activation-pack backends in one linear "
+            "run. BF16 is measured once; every NVFP4 row carries its backend "
+            "and comparison fields report each backend against BF16."
         ),
     )
     parser.add_argument(
@@ -213,6 +235,8 @@ def replace_block_with_nvfp4(
     rank: int,
     *,
     activation_layout: str,
+    lowrank_compute: str,
+    activation_pack_backend: str,
 ) -> list[str]:
     require_native_nvfp4()
     return replace_linear_with_native_full_nvfp4(
@@ -220,6 +244,8 @@ def replace_block_with_nvfp4(
         rank=rank,
         stochastic_rounding=False,
         activation_columnwise=activation_layout == "full",
+        lowrank_compute=lowrank_compute,
+        activation_pack_backend=activation_pack_backend,
     )
 
 
@@ -250,13 +276,23 @@ def activation_supplier(
     return next_tensor
 
 
-def benchmark_projection(layer: torch.nn.Module, batch: int, seq: int, mode: str, args: argparse.Namespace) -> list[dict[str, Any]]:
+def benchmark_projection(
+    layer: torch.nn.Module,
+    batch: int,
+    seq: int,
+    mode: str,
+    args: argparse.Namespace,
+    *,
+    activation_pack_backend: str | None = None,
+) -> list[dict[str, Any]]:
     measured_layer = copy.deepcopy(layer) if mode == "nvfp4" else layer
     if mode == "nvfp4":
         replace_block_with_nvfp4(
             measured_layer,
             args.rank,
             activation_layout=args.activation_layout,
+            lowrank_compute=args.lowrank_compute,
+            activation_pack_backend=activation_pack_backend or args.activation_pack_backend,
         )
     rows = []
     for name, projection in projection_modules(measured_layer).items():
@@ -270,7 +306,7 @@ def benchmark_projection(layer: torch.nn.Module, batch: int, seq: int, mode: str
             cuda_profiler_range=args.cuda_profiler_range,
         )
         flops = logical_projection_flops(batch, seq, projection)
-        rows.append({"projection": name, "mode": mode, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "batch_size": batch, "seq_length": seq, "shape_mkn": [batch * seq, projection.in_features, projection.out_features], "latency_ms": timing, **metric(flops, timing, args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops)})
+        rows.append({"projection": name, "mode": mode, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backend": activation_pack_backend if mode == "nvfp4" else None, "batch_size": batch, "seq_length": seq, "shape_mkn": [batch * seq, projection.in_features, projection.out_features], "latency_ms": timing, **metric(flops, timing, args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops)})
     return rows
 
 
@@ -281,6 +317,8 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
             measured_layer,
             args.rank,
             activation_layout=args.activation_layout,
+            lowrank_compute=args.lowrank_compute,
+            activation_pack_backend=args.activation_pack_backend,
         )
         if mode == "nvfp4"
         else []
@@ -297,21 +335,64 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
 
 
 def paired_speedups(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair modes by workload and report BF16/NVFP4 median-latency speedup."""
-    pairs: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
+    """Report each NVFP4 backend's median speedup over the BF16 baseline."""
+    pairs: dict[tuple[Any, ...], dict[str, Any]] = {}
     for result in results:
         key = (result.get("projection"), result["batch_size"], result["seq_length"])
-        pairs.setdefault(key, {})[result["mode"]] = result
-    return [
-        {
-            "projection": key[0],
-            "batch_size": key[1],
-            "seq_length": key[2],
-            "bf16_over_nvfp4": modes["bf16"]["latency_ms"]["median"] / modes["nvfp4"]["latency_ms"]["median"],
+        pair = pairs.setdefault(key, {"bf16": None, "nvfp4": {}})
+        if result["mode"] == "bf16":
+            pair["bf16"] = result
+        else:
+            pair["nvfp4"][result["activation_pack_backend"]] = result
+    rows = []
+    for key, modes in pairs.items():
+        if modes["bf16"] is None:
+            continue
+        bf16_ms = modes["bf16"]["latency_ms"]["median"]
+        for backend, nvfp4 in modes["nvfp4"].items():
+            nvfp4_ms = nvfp4["latency_ms"]["median"]
+            rows.append({
+                "projection": key[0],
+                "batch_size": key[1],
+                "seq_length": key[2],
+                "activation_pack_backend": backend,
+                "bf16_median_ms": bf16_ms,
+                "nvfp4_median_ms": nvfp4_ms,
+                "bf16_over_nvfp4": bf16_ms / nvfp4_ms,
+            })
+    return rows
+
+
+def backend_comparisons(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join BF16, TE, and centered CUDA rows for convenient A/B reporting."""
+    pairs: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for result in results:
+        key = (result.get("projection"), result["batch_size"], result["seq_length"])
+        pair = pairs.setdefault(key, {"bf16": None, "nvfp4": {}})
+        if result["mode"] == "bf16":
+            pair["bf16"] = result
+        else:
+            pair["nvfp4"][result["activation_pack_backend"]] = result
+    rows = []
+    for key, modes in pairs.items():
+        bf16 = modes["bf16"]
+        te = modes["nvfp4"].get("te")
+        centered = modes["nvfp4"].get("centered_cuda")
+        if bf16 is None:
+            continue
+        row: dict[str, Any] = {
+            "projection": key[0], "batch_size": key[1], "seq_length": key[2],
+            "bf16_median_ms": bf16["latency_ms"]["median"],
         }
-        for key, modes in pairs.items()
-        if {"bf16", "nvfp4"} <= set(modes)
-    ]
+        for label, value in (("te", te), ("centered_cuda", centered)):
+            if value is not None:
+                latency = value["latency_ms"]["median"]
+                row[f"{label}_median_ms"] = latency
+                row[f"bf16_over_{label}"] = row["bf16_median_ms"] / latency
+        if te is not None and centered is not None:
+            row["te_over_centered_cuda"] = te["latency_ms"]["median"] / centered["latency_ms"]["median"]
+        rows.append(row)
+    return rows
 
 
 def main() -> None:
@@ -322,6 +403,8 @@ def main() -> None:
         raise ValueError("sequence length and batch sizes must be positive")
     if args.scope == "transformer" and args.projections is not None:
         raise ValueError("--projections is valid only with --scope linear")
+    if args.scope != "linear" and args.activation_pack_backends is not None:
+        raise ValueError("--activation-pack-backends is valid only with --scope linear")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(20260902)
     set_native_nvfp4_profiling(args.profile_native_ranges)
@@ -330,10 +413,18 @@ def main() -> None:
     for batch in args.batch_sizes:
         for mode in args.modes:
             if args.scope == "linear":
-                results.extend(benchmark_projection(layer, batch, args.seq_length, mode, args))
+                if mode == "nvfp4":
+                    backends = args.activation_pack_backends or (args.activation_pack_backend,)
+                    for backend in backends:
+                        results.extend(benchmark_projection(
+                            layer, batch, args.seq_length, mode, args,
+                            activation_pack_backend=backend,
+                        ))
+                else:
+                    results.extend(benchmark_projection(layer, batch, args.seq_length, mode, args))
             else:
                 results.append(benchmark_block(model, layer, batch, args.seq_length, mode, args))
-    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results)}
+    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "lowrank_compute": args.lowrank_compute, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backends": args.activation_pack_backends or [args.activation_pack_backend], "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results), "backend_comparisons": backend_comparisons(results)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps(payload, indent=2))

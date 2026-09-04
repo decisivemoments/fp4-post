@@ -91,6 +91,24 @@ bash benchmarks/inference_nvfp4_5090/run_qwen_layer_sweep.sh
 By default this writes separate `up_proj` and `down_proj` JSON results. Use
 `LOWRANK_PROJECTIONS` and `LOWRANK_BATCH_SIZES` to narrow the sweep.
 
+To use the separately-quantized U and `scaled_v` NVFP4 low-rank path in the
+full native linear benchmark, set `LOWRANK_COMPUTE=nvfp4`. This mode is
+inference-only and intentionally does not fold singular values into U:
+
+```bash
+RUN_SWEEP=1 RUN_PHASE1_PROFILE=0 LOWRANK_COMPUTE=nvfp4 \
+bash benchmarks/inference_nvfp4_5090/run_qwen_layer_sweep.sh
+```
+
+Before using that mode for model inference, compare full native-linear output
+error against the BF16 low-rank reference:
+
+```bash
+RUN_SWEEP=0 RUN_PHASE1_PROFILE=0 RUN_LOWRANK_BENCHMARK=0 \
+RUN_LOWRANK_VALIDATION=1 \
+bash benchmarks/inference_nvfp4_5090/run_qwen_layer_sweep.sh
+```
+
 每项 JSON 含中位延迟、逻辑 FLOPs、逻辑 TFLOP/s、相对于单卡 RTX 5090 dense
 BF16/NVFP4 峰值的等效利用率，以及逐 batch/projection 的
 `bf16_over_nvfp4` 加速比。计算定义及固定 batch 的 FLOPs 表见

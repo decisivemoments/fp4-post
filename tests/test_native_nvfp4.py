@@ -295,6 +295,34 @@ def test_shared_activation_group_reuses_one_packed_tensor():
     assert first is second
 
 
+def test_native_full_nvfp4_lowrank_nvfp4_is_inference_only():
+    require_native_nvfp4()
+    torch.manual_seed(18)
+    source = torch.nn.Linear(
+        128,
+        256,
+        bias=False,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    layer = NativeFullNVFP4Linear.from_linear(
+        source,
+        rank=64,
+        stochastic_rounding=False,
+        lowrank_compute="nvfp4",
+    )
+    x = torch.randn(2, 16, 128, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(RuntimeError, match="inference-only"):
+        layer(x)
+
+    with torch.inference_mode():
+        output = layer(x)
+    assert output.shape == (2, 16, 256)
+    assert torch.isfinite(output).all()
+    assert "u" in layer._weight_cache
+
+
 def test_optimizer_hook_invalidates_fused_adam_weight_cache():
     require_native_nvfp4()
     torch.manual_seed(19)

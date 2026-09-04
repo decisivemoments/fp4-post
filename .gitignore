@@ -27,3 +27,6 @@ pic/
 
 
 **/.DS_Store
+
+build
+*.so

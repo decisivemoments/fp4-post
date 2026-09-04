@@ -13,17 +13,20 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3,4,5}"
 # Phase 1: compare a known fast shape (down_proj) with a known slow shape
 # (up_proj), both at a large enough M to make the contrast visible.  This is
 # deliberately opt-in: an Nsight trace is much slower than the normal sweep.
-RUN_SWEEP="${RUN_SWEEP:-0}"
-RUN_PHASE1_PROFILE="${RUN_PHASE1_PROFILE:-0}"
-RUN_LOWRANK_BENCHMARK="${RUN_LOWRANK_BENCHMARK:-1}"
+RUN_SWEEP="${RUN_SWEEP:-1}"
+RUN_PHASE1_PROFILE="${RUN_PHASE1_PROFILE:-1}"
+RUN_LOWRANK_BENCHMARK="${RUN_LOWRANK_BENCHMARK:-0}"
+RUN_LOWRANK_VALIDATION="${RUN_LOWRANK_VALIDATION:-0}"
 PROFILE_BATCH_SIZE="${PROFILE_BATCH_SIZE:-256}"
 PROFILE_WARMUP="${PROFILE_WARMUP:-5}"
 PROFILE_ITERATIONS="${PROFILE_ITERATIONS:-5}"
 PROFILE_PROJECTIONS="${PROFILE_PROJECTIONS:-down_proj up_proj}"
 # "rowwise" omits backward-only columnwise activation packing.  Keep full
 # first so a failed experimental TE layout does not hide the baseline trace.
-PROFILE_ACTIVATION_LAYOUTS="${PROFILE_ACTIVATION_LAYOUTS:-full rowwise}"
+PROFILE_ACTIVATION_LAYOUTS="${PROFILE_ACTIVATION_LAYOUTS:-rowwise}"
+LOWRANK_COMPUTE="${LOWRANK_COMPUTE:-bf16}"
 NSYS_BIN="${NSYS_BIN:-nsys}"
+QUANT_BACKEND="${QUANT_BACKEND:-centered_cuda}"
 
 run_lowrank_benchmark() {
   local model="$1"
@@ -43,6 +46,26 @@ run_lowrank_benchmark() {
         --seq-length "${SEQ_LENGTH}" \
         --warmup "${WARMUP}" --iterations "${ITERATIONS}" \
         --output "${OUTPUT_ROOT}/lowrank_${model}_${projection}.json"
+  done
+}
+
+run_lowrank_validation() {
+  local model="$1"
+  local model_path="$2"
+  local projection
+  local path_args=()
+
+  if [[ -n "${model_path}" ]]; then
+    path_args=(--model-path "${model_path}")
+  fi
+  for projection in ${LOWRANK_PROJECTIONS:-up_proj down_proj}; do
+    PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+      python "${ROOT}/benchmarks/inference_nvfp4_5090/validate_lowrank_nvfp4.py" \
+        --model "${model}" "${path_args[@]}" \
+        --projection "${projection}" \
+        --batch-sizes ${LOWRANK_VALIDATION_BATCH_SIZES:-1 16 64 128} \
+        --seq-length "${SEQ_LENGTH}" \
+        --output "${OUTPUT_ROOT}/lowrank_validation_${model}_${projection}.json"
   done
 }
 
@@ -72,15 +95,17 @@ run_phase1_profile() {
           --trace=cuda,nvtx,osrt \
           --capture-range=cudaProfilerApi \
           --capture-range-end=stop \
-          --output "${profile_root}/${projection}_${activation_layout}_b${PROFILE_BATCH_SIZE}" \
+          --output "${profile_root}/${projection}_${activation_layout}_b${PROFILE_BATCH_SIZE}_${QUANT_BACKEND}_fused" \
         python "${ROOT}/benchmarks/inference_nvfp4_5090/benchmark_qwen_inference.py" \
           --scope linear --model "${model}" "${path_args[@]}" \
           --modes nvfp4 --projections "${projection}" \
           --batch-sizes "${PROFILE_BATCH_SIZE}" --seq-length "${SEQ_LENGTH}" \
           --activation-mode fresh --activation-layout "${activation_layout}" \
+          --lowrank-compute "${LOWRANK_COMPUTE}" \
           --profile-native-ranges --cuda-profiler-range \
           --warmup "${PROFILE_WARMUP}" --iterations "${PROFILE_ITERATIONS}" \
-          --output "${profile_root}/${projection}_${activation_layout}_b${PROFILE_BATCH_SIZE}.json"
+          --output "${profile_root}/${projection}_${activation_layout}_b${PROFILE_BATCH_SIZE}_${QUANT_BACKEND}_fused.json" \
+          --activation-pack-backend "${QUANT_BACKEND}"
     done
   done
 }
@@ -99,8 +124,11 @@ for model in qwen0.5b; do
       PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" python "${ROOT}/benchmarks/inference_nvfp4_5090/benchmark_qwen_inference.py" \
         --scope "${scope}" --model "${model}" "${path_args[@]}" \
         --seq-length "${SEQ_LENGTH}" --batch-sizes ${BATCH_SIZES} \
+        --lowrank-compute "${LOWRANK_COMPUTE}" \
         --warmup "${WARMUP}" --iterations "${ITERATIONS}" \
-        --output "${OUTPUT_ROOT}/${scope}_${model}.json"
+        --output "${OUTPUT_ROOT}/${scope}_${model}.json" \
+        --activation-pack-backend "${QUANT_BACKEND}" \
+        --activation-layout "${PROFILE_ACTIVATION_LAYOUTS}"
     done
   fi
 
@@ -110,5 +138,9 @@ for model in qwen0.5b; do
 
   if [[ "${RUN_LOWRANK_BENCHMARK}" == "1" ]]; then
     run_lowrank_benchmark "${model}" "${model_path}"
+  fi
+
+  if [[ "${RUN_LOWRANK_VALIDATION}" == "1" ]]; then
+    run_lowrank_validation "${model}" "${model_path}"
   fi
 done
