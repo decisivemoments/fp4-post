@@ -1,0 +1,9 @@
+# CUDA, PyTorch and Transformer Engine are supplied by the
+# sm-controller-5090:pt26.04-te2.15-sm120a container image.
+transformers==4.57.6
+trl==0.29.1
+accelerate==1.14.0
+peft==0.19.1
+datasets==5.0.0
+math-verify==0.9.0
+latex2sympy2-extended==1.11.0
