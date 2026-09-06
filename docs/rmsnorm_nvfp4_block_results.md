@@ -30,7 +30,7 @@ mean_ref, packed_ref = fused_mean_and_quantize_centered_rowwise(y_ref, q)
 | 本次 BF16 block | 32.802 ms | 1.640x slower |
 | 当前 native NVFP4，无 RMSNorm fusion | 23.843 ms | 1.192x slower |
 | 新 RMSNorm-fused native NVFP4 | **20.002 ms** | 1.000x |
-| 历史初始 native FP4 记录 | 23.947 ms | 1.197x slower |
+| 历史 native NVFP4 记录（无 commit provenance） | 23.947 ms | 1.197x slower |
 
 因此新融合相对同次运行、无 RMSNorm fusion 的当前 native NVFP4：
 
@@ -39,7 +39,7 @@ mean_ref, packed_ref = fused_mean_and_quantize_centered_rowwise(y_ref, q)
 latency reduction = 16.1%
 ```
 
-相对用户指定的历史初始结果
+相对用户指定的历史结果
 [`transformer_qwen0.5b.json`](../outputs/inference_nvfp4_5090/transformer_qwen0.5b.json) 的
 batch=256 NVFP4 median 23.947 ms：
 
@@ -48,6 +48,10 @@ batch=256 NVFP4 median 23.947 ms：
 latency reduction = 16.5%
 ```
 
+该 JSON 未记录 git SHA 或 kernel dispatch；但 dual-FP4 mean-correction 的 NCU 结果在
+2026-09-06 14:37 已生成，而 JSON 的文件时间为 15:21，且它与本次“已启用 dual、未融合
+RMSNorm”的 23.843 ms 仅相差 0.4%。因此它很可能已经包含 dual-FP4，不能作为
+“未优化 dual GEMM”的对照。双路径的公平隔离对照是本次 23.843 ms 与 20.002 ms。
 本次 BF16 32.802 ms 与历史 BF16 33.204 ms 接近，说明历史比较没有明显的环境量级偏差。
 结果 JSON 分别为：
 
