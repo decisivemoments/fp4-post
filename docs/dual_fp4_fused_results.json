@@ -1,0 +1,365 @@
+{
+  "date": "2026-09-06",
+  "gpu_uuid": "GPU-f9d7a2e3-1ba4-f5f2-2a72-426201979f99",
+  "base_commit": "511d197597011b35a7c0c4da864331ccadc3520c",
+  "cutlass_commit": "59e3a3338d516ca6ce0e073af8da65289678a35c",
+  "cuda": "13.2",
+  "driver": "595.71.05",
+  "transformer_engine": "2.18.0",
+  "tests": {
+    "functional": 12,
+    "full_target_prefill": 2,
+    "tolerance": {
+      "rtol": 0.02,
+      "atol": 0.125
+    },
+    "memcheck": {
+      "cases": 12,
+      "errors": 0
+    },
+    "racecheck": {
+      "cases": 4,
+      "hazards": 0
+    },
+    "synccheck": {
+      "cases": 4,
+      "errors": 0
+    }
+  },
+  "benchmarks": [
+    {
+      "m": 8192,
+      "n": 4864,
+      "k": 896,
+      "rank": 64,
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "torch": "2.12.1+cu132",
+      "scope": "post-quantization including device alpha setup and launch",
+      "timings": {
+        "te_fp4_plus_te_nvfp4": {
+          "median_ms": 0.16291199624538422,
+          "samples_ms": [
+            0.18384000658988953,
+            0.17132799327373505,
+            0.16771200299263,
+            0.18028800189495087,
+            0.16358399391174316,
+            0.1664000004529953,
+            0.15984000265598297,
+            0.16236799955368042,
+            0.16412800550460815,
+            0.15990400314331055,
+            0.1761920005083084,
+            0.163455992937088,
+            0.1656319946050644,
+            0.15875199437141418,
+            0.1597760021686554,
+            0.1600639969110489,
+            0.15830400586128235,
+            0.15769599378108978,
+            0.15654399991035461,
+            0.1579200029373169
+          ]
+        },
+        "bf16_single_store": {
+          "median_ms": 0.2303680032491684,
+          "samples_ms": [
+            0.2417600005865097,
+            0.23148800432682037,
+            0.23046399652957916,
+            0.23190400004386902,
+            0.22908799350261688,
+            0.22790400683879852,
+            0.23097600042819977,
+            0.22864000499248505,
+            0.2303680032491684,
+            0.23132799565792084,
+            0.2303680032491684,
+            0.22844800353050232,
+            0.22995199263095856,
+            0.23049600422382355,
+            0.22828799486160278,
+            0.2285120040178299,
+            0.2295680046081543,
+            0.23014399409294128,
+            0.2303680032491684,
+            0.23059199750423431
+          ]
+        },
+        "dual_fp4_single_store": {
+          "median_ms": 0.12238400056958199,
+          "samples_ms": [
+            0.13036799430847168,
+            0.12441600114107132,
+            0.12371200323104858,
+            0.12176000326871872,
+            0.12223999947309494,
+            0.12284799665212631,
+            0.1223360002040863,
+            0.12188799679279327,
+            0.12281599640846252,
+            0.12118399888277054,
+            0.12246400117874146,
+            0.12281599640846252,
+            0.12188799679279327,
+            0.12214399874210358,
+            0.1226240023970604,
+            0.12236800044775009,
+            0.12758399546146393,
+            0.12240000069141388,
+            0.12160000205039978,
+            0.12057600170373917
+          ]
+        }
+      }
+    },
+    {
+      "m": 131072,
+      "n": 4864,
+      "k": 896,
+      "rank": 64,
+      "gpu": "NVIDIA GeForce RTX 5090",
+      "torch": "2.12.1+cu132",
+      "scope": "post-quantization including device alpha setup and launch",
+      "timings": {
+        "te_fp4_plus_te_nvfp4": {
+          "median_ms": 3.056607961654663,
+          "samples_ms": [
+            2.964832067489624,
+            2.9650559425354004,
+            2.9571518898010254,
+            2.9542720317840576,
+            2.9617600440979004,
+            2.9541759490966797,
+            2.9554240703582764,
+            3.0512959957122803,
+            3.0811519622802734,
+            3.0760960578918457,
+            3.068864107131958,
+            3.0712320804595947,
+            3.071455955505371,
+            3.068864107131958,
+            3.056351900100708,
+            3.057663917541504,
+            3.056864023208618,
+            3.055327892303467,
+            3.059936046600342,
+            4.333375930786133
+          ]
+        },
+        "bf16_single_store": {
+          "median_ms": 2.9632480144500732,
+          "samples_ms": [
+            3.189824104309082,
+            3.053152084350586,
+            3.047071933746338,
+            3.0488319396972656,
+            3.046175956726074,
+            3.045664072036743,
+            3.040800094604492,
+            2.9560320377349854,
+            2.95580792427063,
+            2.9569919109344482,
+            2.9624319076538086,
+            2.960383892059326,
+            2.9572479724884033,
+            2.9612479209899902,
+            2.959007978439331,
+            2.9667840003967285,
+            2.9630720615386963,
+            2.9634881019592285,
+            2.96342396736145,
+            2.9575040340423584
+          ]
+        },
+        "dual_fp4_single_store": {
+          "median_ms": 1.5629760026931763,
+          "samples_ms": [
+            1.4797760248184204,
+            1.4627200365066528,
+            1.4606399536132812,
+            1.455456018447876,
+            1.4582079648971558,
+            1.4567680358886719,
+            1.4559999704360962,
+            1.4608319997787476,
+            1.481600046157837,
+            1.573024034500122,
+            1.5627520084381104,
+            1.565727949142456,
+            1.5648000240325928,
+            1.5677440166473389,
+            1.5697920322418213,
+            1.5665600299835205,
+            1.5631999969482422,
+            1.564479947090149,
+            1.5716160535812378,
+            1.5665600299835205
+          ]
+        }
+      }
+    }
+  ],
+  "ncu": {
+    "metrics": {
+      "Kernel Name": {
+        "value": "void device_kernel<DualFp4GemmUniversal<tuple<int, int, int, int>, CollectiveMma<MainloopSm120TmaWarpSpecializedBlockScaled<4, 3, tuple<C<1>, C<1>, C<1>>, KernelTmaWarpSpecializedCooperativeBlockScaledSm120<3>>, tuple<C<128>, C<128>, C<128>>, tuple<float_e2m1_t, float_ue4m3_t>, tuple<tuple<long, C<1>, long>, Layout<tuple<tuple<tuple<C<32>, C<4>>, int>, tuple<tuple<C<16>, C<4>>, int>, tuple<C<1>, int>>, tuple<tuple<tuple<C<16>, C<4>>, int>, tuple<tuple<C<0>, C<1>>, C<512>>, tuple<C<0>, int>>>>, tuple<float_e2m1_t, float_ue4m3_t>, tuple<tuple<long, C<1>, long>, Layout<tuple<tuple<tuple<C<32>, C<4>>, int>, tuple<tuple<C<16>, C<4>>, int>, tuple<C<1>, int>>, tuple<tuple<tuple<C<16>, C<4>>, int>, tuple<tuple<C<0>, C<1>>, C<512>>, tuple<C<0>, int>>>>, TiledMMA<MMA_Atom<SM120_16x8x64_TN_VS<float_e2m1_t, float_e2m1_t, float, float_ue4m3_t, 16>>, Layout<tuple<C<4>, C<2>, C<1>>, tuple<C<1>, C<4>, C<0>>>, tuple<C<128>, Layout<tuple<C<8>, C<2>, C<2>>, tuple<C<1>, C<16>, C<8>>>, C<64>>>, tuple<SM90_TMA_LOAD, SM90_TMA_LOAD>, tuple<ComposedLayout<Swizzle<2, 4, 3>, smem_ptr_flag_bits<4>, Layout<tuple<C<8>, C<128>>, tuple<C<128>, C<1>>>>, Layout<tuple<tuple<tuple<C<32>, C<4>>, C<1>>, tuple<tuple<C<16>, C<4>>, C<1>, C<2>>>, tuple<tuple<tuple<C<16>, C<4>>, C<512>>, tuple<tuple<C<0>, C<1>>, C<4>, C<512>>>>>, tuple<Copy_Atom<SM75_U32x4_LDSM_N, integer_subbyte<4, 0>>, Copy_Atom<UniversalCopy<float_ue4m3_t, float_ue4m3_t>, float_ue4m3_t>>, identity, tuple<SM90_TMA_LOAD, SM90_TMA_LOAD>, tuple<ComposedLayout<Swizzle<2, 4, 3>, smem_ptr_flag_bits<4>, Layout<tuple<C<8>, C<128>>, tuple<C<128>, C<1>>>>, Layout<tuple<tuple<tuple<C<32>, C<4>>, C<1>>, tuple<tuple<C<16>, C<4>>, C<1>, C<2>>>, tuple<tuple<tuple<C<16>, C<4>>, C<512>>, tuple<tuple<C<0>, C<1>>, C<4>, C<512>>>>>, tuple<Copy_Atom<SM75_U32x4_LDSM_N, integer_subbyte<4, 0>>, Copy_Atom<UniversalCopy<float_ue4m3_t, float_ue4m3_t>, float_ue4m3_t>>, identity>, CollectiveEpilogue<Sm90TmaWarpSpecialized<3, 2, 4, 1, 0>, tuple<C<128>, C<128>, C<128>>, tuple<C<64>, C<32>>, bfloat16_t, tuple<long, C<1>, long>, bfloat16_t, tuple<long, C<1>, long>, FusionCallbacks<Sm120TmaWarpSpecialized<3, 2, 4, 1, 0>, LinearCombination<bfloat16_t, float, bfloat16_t, float, 2>, tuple<C<128>, C<128>, C<128>>, tuple<C<64>, C<32>>, >, SM90_TMA_LOAD, ComposedLayout<Swizzle<2, 4, 3>, smem_ptr_flag_bits<16>, Layout<tuple<C<8>, C<32>>, tuple<C<32>, C<1>>>>, SM75_U32x2_LDSM_N, SM90_TMA_STORE, ComposedLayout<Swizzle<2, 4, 3>, smem_ptr_flag_bits<16>, Layout<tuple<C<8>, C<32>>, tuple<C<32>, C<1>>>>, SM90_U32x2_STSM_N, Copy_Atom<SM90_U32x2_STSM_N, half_t>, void>, void>>(Params)",
+        "unit": ""
+      },
+      "Block Size": {
+        "value": "(384, 1, 1)",
+        "unit": ""
+      },
+      "Grid Size": {
+        "value": "(38, 1024, 1)",
+        "unit": ""
+      },
+      "Device": {
+        "value": "0",
+        "unit": ""
+      },
+      "CC": {
+        "value": "12.0",
+        "unit": ""
+      },
+      "dram__bytes_op_read.sum": {
+        "value": "73575168",
+        "unit": "byte"
+      },
+      "dram__bytes_op_write.sum": {
+        "value": "1241652736",
+        "unit": "byte"
+      },
+      "dram__sectors_op_write.sum": {
+        "value": "38801648",
+        "unit": "sector"
+      },
+      "gpu__time_duration.sum": {
+        "value": "1593408",
+        "unit": "ns"
+      },
+      "launch__occupancy_limit_registers": {
+        "value": "1",
+        "unit": "block"
+      },
+      "launch__occupancy_limit_shared_mem": {
+        "value": "1",
+        "unit": "block"
+      },
+      "launch__registers_per_thread": {
+        "value": "168",
+        "unit": "register/thread"
+      },
+      "launch__shared_mem_per_block_dynamic": {
+        "value": "88064",
+        "unit": "byte/block"
+      },
+      "lts__t_sectors.sum": {
+        "value": "220247667",
+        "unit": "sector"
+      },
+      "lts__t_sectors_srcunit_tex_op_write.sum": {
+        "value": "39845888",
+        "unit": "sector"
+      },
+      "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed": {
+        "value": "51.49",
+        "unit": "%"
+      },
+      "sm__warps_active.avg.pct_of_peak_sustained_active": {
+        "value": "20.85",
+        "unit": "%"
+      },
+      "smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio": {
+        "value": "0.63",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_branch_resolving_per_issue_active.ratio": {
+        "value": "0.51",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_dispatch_stall_per_issue_active.ratio": {
+        "value": "0.08",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_drain_per_issue_active.ratio": {
+        "value": "0.00",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio": {
+        "value": "0",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+        "value": "0.78",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_math_pipe_throttle_per_issue_active.ratio": {
+        "value": "2.01",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_membar_per_issue_active.ratio": {
+        "value": "0",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_mio_throttle_per_issue_active.ratio": {
+        "value": "0.44",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_misc_per_issue_active.ratio": {
+        "value": "0.01",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio": {
+        "value": "0.28",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_not_selected_per_issue_active.ratio": {
+        "value": "0.36",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_selected_per_issue_active.ratio": {
+        "value": "1.00",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio": {
+        "value": "0.23",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_sleeping_per_issue_active.ratio": {
+        "value": "2.25",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_tex_throttle_per_issue_active.ratio": {
+        "value": "0",
+        "unit": "inst"
+      },
+      "smsp__average_warps_issue_stalled_wait_per_issue_active.ratio": {
+        "value": "2.41",
+        "unit": "inst"
+      },
+      "smsp__warps_active.avg.peak_sustained": {
+        "value": "12",
+        "unit": "warp"
+      },
+      "smsp__warps_active.avg.per_cycle_active": {
+        "value": "2.50",
+        "unit": "warp"
+      }
+    },
+    "sector_bytes": 32,
+    "derived_l2_total_bytes": 7047925344,
+    "derived_l2_write_bytes": 1275068416,
+    "expected_y_bytes": 1275068416,
+    "raw_report": "outputs/inference_nvfp4_5090/profiles/dual_fp4_fused/ncu_dual_fp4.ncu-rep"
+  },
+  "source_sha256": {
+    "csrc/fused_residual_lowrank_nvfp4/dual_fp4_kernel.hpp": "b5a5547f1a225fc8469d0359a5e87b3ae24fb32ce06e2d78f591585fe2cf0513",
+    "csrc/fused_residual_lowrank_nvfp4/fused_residual_lowrank_nvfp4.cu": "474df31cac6a2e3a35f214005c0fffc3d906a05b41fe3fb30361f605b17c04a6",
+    "csrc/fused_residual_lowrank_nvfp4/setup.py": "8cc786d5bfc1c1adb45f4b9f75a4e03b4e62e30914928def200a919105b09269",
+    "csrc/fused_residual_lowrank_nvfp4/binding.cpp": "7fc982ac5d955ea1867d6e15cd2b6016f05858743d464413635000fe9bd34979",
+    "src/Metis/Metis/fused_residual_lowrank_nvfp4.py": "67109d9da0577baf24001c9362046449b50cd9c82f49eccd0d35e15747033da0",
+    "tests/test_fused_residual_lowrank_nvfp4.py": "b518064d0db7fc38cfd6e383d028d2e3def7bd9fb087ef83a45148f91e6ee90d",
+    "benchmarks/inference_nvfp4_5090/benchmark_fused_residual_lowrank_nvfp4.py": "cd70cb880a1e740d5e8bac3d4d5789d0bb875795b62eeb21916dc8d2d0de9ceb"
+  }
+}

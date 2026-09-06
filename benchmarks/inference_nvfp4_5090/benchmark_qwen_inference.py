@@ -331,7 +331,26 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         cuda_profiler_range=args.cuda_profiler_range,
     )
     flops = decoder_gemm_flops(measured_layer, batch, seq)
-    return {"scope": "transformer", "mode": mode, "batch_size": batch, "seq_length": seq, "layer_index": args.layer_index, "replaced_modules": replaced, "latency_ms": timing, **metric(flops, timing, args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops)}
+    # Keep the result schema compatible with benchmark_projection().  The
+    # shared paired_speedups()/backend_comparisons() helpers run for both
+    # scopes and index every NVFP4 row by this field.
+    return {
+        "scope": "transformer",
+        "mode": mode,
+        "activation_pack_backend": (
+            args.activation_pack_backend if mode == "nvfp4" else None
+        ),
+        "batch_size": batch,
+        "seq_length": seq,
+        "layer_index": args.layer_index,
+        "replaced_modules": replaced,
+        "latency_ms": timing,
+        **metric(
+            flops,
+            timing,
+            args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops,
+        ),
+    }
 
 
 def paired_speedups(results: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -428,10 +428,40 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
         lowrank_compute: str,
     ) -> torch.Tensor:
         input_shape = tuple(input_.shape)
-        residual_output = _native_mean_fprop(
-            packed_activation,
-            packed_residual_weight,
+        # The dual-FP4 fusion consumes the centered activation residual and
+        # therefore cannot use _native_mean_fprop's GEMM bias directly. Keep
+        # its mathematically required per-output mean correction explicit.
+        # The correction vector is broadcast in the fused epilogue.
+        # Unsupported shapes retain the existing TE beta=1 path below.
+        use_dual_fp4_fusion = (
+            lowrank_compute == "nvfp4"
+            # The custom collective is an SM120 rank-64 kernel with fixed
+            # 128x128 output tiles and a 64-wide K granularity.
+            and torch.cuda.get_device_capability(input_.device) == (12, 0)
+            and packed_activation.packed_rows % 128 == 0
+            and residual_weight.shape[0] % 128 == 0
+            and residual_weight.shape[1] % 64 == 0
+            and u_weight.shape[1] == 64
         )
+        if use_dual_fp4_fusion:
+            with _native_profile_range(
+                "native_nvfp4.fused_residual_mean_correction"
+            ):
+                residual_dequantized = packed_residual_weight.dequantized()
+                residual_mean_correction = F.linear(
+                    packed_activation.mean, residual_dequantized
+                )
+                if bias is not None:
+                    # Fold module bias into the small vector as well, so a
+                    # biased layer does not reintroduce an MxN output add.
+                    residual_mean_correction = residual_mean_correction + bias
+                packed_residual_weight.release_dequantized()
+                del residual_dequantized
+        else:
+            residual_output = _native_mean_fprop(
+                packed_activation,
+                packed_residual_weight,
+            )
         v_output = _native_mean_fprop(
             packed_activation,
             packed_v_weight,
@@ -459,27 +489,71 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
                     rowwise=True,
                     columnwise=False,
                 )
+                # _native_mean_fprop returns only logical rows.  In the
+                # fused path, Z must instead have the same padded M extent as
+                # X because both operands are consumed by the same 128-row
+                # collective tiles.  Padding is zero and is cropped away
+                # before this Function returns.
+                scaled_v_for_nvfp4 = scaled_v_output
+                if use_dual_fp4_fusion and (
+                    packed_activation.packed_rows != packed_activation.rows
+                ):
+                    scaled_v_for_nvfp4 = F.pad(
+                        scaled_v_output,
+                        (
+                            0,
+                            0,
+                            0,
+                            packed_activation.packed_rows
+                            - packed_activation.rows,
+                        ),
+                    )
                 packed_scaled_v = scaled_v_quantizer.quantize(
-                    scaled_v_output
+                    scaled_v_for_nvfp4
                 )
             with _native_profile_range("native_nvfp4.lowrank_nvfp4_gemm"):
-                # Write directly into residual_output with beta=1, avoiding a
-                # separate MxN BF16 output add. U and scaled_v are separately
-                # quantized; singular values are intentionally not folded U.
-                output = general_gemm(
-                    packed_u_weight.quantized,
-                    packed_scaled_v,
-                    out_dtype=torch.bfloat16,
-                    layout="TN",
-                    out=residual_output,
-                    beta=1.0,
-                    accumulate=True,
-                )[0]
-                if output is None:
-                    output = residual_output
+                if use_dual_fp4_fusion:
+                    from .fused_residual_lowrank_nvfp4 import (
+                        fused_residual_lowrank_nvfp4,
+                    )
+
+                    # The packed activation can be row-padded for native
+                    # NVFP4 alignment.  The fused kernel must cover those
+                    # rows too, then we crop to the logical activation rows.
+                    output = torch.empty(
+                        packed_activation.packed_rows,
+                        residual_weight.shape[0],
+                        device=input_.device,
+                        dtype=torch.bfloat16,
+                    )
+                    fused_residual_lowrank_nvfp4(
+                        packed_activation.quantized_residual,
+                        packed_residual_weight.quantized,
+                        packed_scaled_v,
+                        packed_u_weight.quantized,
+                        residual_mean_correction.squeeze(0).contiguous(),
+                        output,
+                    )
+                    output = output[: packed_activation.rows]
+                else:
+                    # Write directly into residual_output with beta=1,
+                    # avoiding a separate MxN BF16 output add. U and
+                    # scaled_v are separately quantized; singular values are
+                    # intentionally not folded into U.
+                    output = general_gemm(
+                        packed_u_weight.quantized,
+                        packed_scaled_v,
+                        out_dtype=torch.bfloat16,
+                        layout="TN",
+                        out=residual_output,
+                        beta=1.0,
+                        accumulate=True,
+                    )[0]
+                    if output is None:
+                        output = residual_output
         else:
             raise ValueError(f"Unsupported low-rank compute mode: {lowrank_compute}")
-        if bias is not None:
+        if bias is not None and not use_dual_fp4_fusion:
             with _native_profile_range("native_nvfp4.fprop_bias_add"):
                 output = output + bias
 

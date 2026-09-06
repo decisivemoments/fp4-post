@@ -353,3 +353,59 @@ def test_optimizer_hook_invalidates_fused_adam_weight_cache():
         assert cached_after is not cached_before
     finally:
         hook.remove()
+
+
+@pytest.mark.parametrize("rows,fused", [(128, True), (97, True), (225, True), (48, False)])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_native_dual_fp4_mean_correction_and_padding(rows, fused, with_bias):
+    """Nonzero mean makes omission detectable; logical rows test Z padding."""
+    from unittest.mock import patch
+    import Metis.Metis.fused_residual_lowrank_nvfp4 as api
+
+    require_native_nvfp4()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("SM120 required")
+    torch.manual_seed(91)
+    layer = NativeFullNVFP4Linear(128, 256, rank=64, bias=with_bias,
+        device="cuda", stochastic_rounding=False, activation_columnwise=False,
+        lowrank_compute="nvfp4")
+    x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16) + 2
+    with torch.inference_mode(), patch.object(api, "fused_residual_lowrank_nvfp4",
+                                             wraps=api.fused_residual_lowrank_nvfp4) as call:
+        actual = layer(x)
+        assert call.call_count == int(fused)
+        packed = layer.activation_group._packed
+        if rows in (97, 225):
+            assert packed.packed_rows != packed.rows
+        if fused:
+            args = call.call_args.args
+            assert args[4].shape == (256,)
+            assert args[2].get_metadata()["rowwise_data"].size(0) == packed.packed_rows
+        # Independent two-TE-GEMM reference isolates fusion error from the
+        # intentional FP4 quantization error relative to BF16 low-rank.
+        from transformer_engine.pytorch.cpp_extensions import general_gemm
+        te_expected = _native_mean_fprop(packed, layer._weight_cache["residual"][1])
+        v = _native_mean_fprop(packed, layer._weight_cache["v"][1])
+        z = v * layer.singular_values
+        if fused and packed.packed_rows != rows:
+            z = F.pad(z, (0, 0, 0, packed.packed_rows - rows))
+        q = _get_quantizer(x.device, stochastic_rounding=False, rowwise=True, columnwise=False)
+        # For padded rows the low-rank reference also computes its full M.
+        correction = general_gemm(layer._weight_cache["u"][1].quantized, q.quantize(z),
+                                  out_dtype=torch.bfloat16, layout="TN")[0][:rows]
+        te_expected = te_expected + correction
+        if layer.bias is not None:
+            te_expected = te_expected + layer.bias
+        torch.testing.assert_close(actual, te_expected, rtol=0.02, atol=0.02)
+        layer.lowrank_compute = "bf16"
+        expected = layer(x)
+        assert actual.shape == (rows, 256)
+        assert torch.isfinite(actual).all()
+        # Compare to BF16 without treating the intentional Z/U FP4 error
+        # as a mean-fusion defect. Fusion may add at most 0.5% relative L2
+        # beyond the independently measured two-TE reference error.
+        actual_error = relative_l2_error(actual, expected)
+        quantization_error = relative_l2_error(te_expected, expected)
+        assert actual_error <= quantization_error + 0.005
+        print(f"rows={rows} bias={with_bias} bf16_relative_l2={actual_error:.6f} "
+              f"te_quantization_relative_l2={quantization_error:.6f}")
