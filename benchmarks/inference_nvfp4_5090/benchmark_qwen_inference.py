@@ -37,6 +37,10 @@ from Metis.Metis.native_nvfp4 import (  # noqa: E402
 from Metis.Metis.qwen2_block_nvfp4 import (  # noqa: E402
     fuse_qwen2_decoder_layer_norms,
 )
+from Metis.Metis.direct_nvfp4 import (  # noqa: E402
+    DirectNVFP4Linear,
+    replace_linear_with_direct_nvfp4,
+)
 
 
 MODEL_IDS = {
@@ -54,7 +58,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--scope", choices=("linear", "transformer"), required=True)
     parser.add_argument("--model", choices=tuple(MODEL_IDS), required=True)
     parser.add_argument("--model-path", help="Local path overrides the Hugging Face model id.")
-    parser.add_argument("--modes", nargs="+", choices=("bf16", "nvfp4"), default=("bf16", "nvfp4"))
+    parser.add_argument("--modes", nargs="+", choices=("bf16", "nvfp4", "direct_nvfp4"), default=("bf16", "nvfp4"))
     parser.add_argument(
         "--projections",
         nargs="+",
@@ -192,7 +196,7 @@ def projection_modules(layer: torch.nn.Module) -> dict[str, torch.nn.Module]:
         name.rsplit(".", 1)[-1]: module
         for name, module in layer.named_modules()
         if name.rsplit(".", 1)[-1] in PROJECTIONS
-        and isinstance(module, (torch.nn.Linear, NativeFullNVFP4Linear))
+        and isinstance(module, (torch.nn.Linear, NativeFullNVFP4Linear, DirectNVFP4Linear))
     }
     missing = set(PROJECTIONS) - set(found)
     if missing:
@@ -306,7 +310,7 @@ def benchmark_projection(
     *,
     activation_pack_backend: str | None = None,
 ) -> list[dict[str, Any]]:
-    measured_layer = copy.deepcopy(layer) if mode == "nvfp4" else layer
+    measured_layer = copy.deepcopy(layer) if mode != "bf16" else layer
     if mode == "nvfp4":
         replace_block_with_nvfp4(
             measured_layer,
@@ -316,6 +320,8 @@ def benchmark_projection(
             activation_pack_backend=activation_pack_backend or args.activation_pack_backend,
             enable_dual_fp4_fusion=not args.disable_dual_fp4_fusion,
         )
+    elif mode == "direct_nvfp4":
+        replace_linear_with_direct_nvfp4(measured_layer, set(PROJECTIONS))
     rows = []
     for name, projection in projection_modules(measured_layer).items():
         if args.projections is not None and name not in args.projections:
@@ -328,12 +334,12 @@ def benchmark_projection(
             cuda_profiler_range=args.cuda_profiler_range,
         )
         flops = logical_projection_flops(batch, seq, projection)
-        rows.append({"projection": name, "mode": mode, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backend": activation_pack_backend if mode == "nvfp4" else None, "batch_size": batch, "seq_length": seq, "shape_mkn": [batch * seq, projection.in_features, projection.out_features], "latency_ms": timing, **metric(flops, timing, args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops)})
+        rows.append({"projection": name, "mode": mode, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backend": activation_pack_backend if mode == "nvfp4" else ("te_direct" if mode == "direct_nvfp4" else None), "batch_size": batch, "seq_length": seq, "shape_mkn": [batch * seq, projection.in_features, projection.out_features], "latency_ms": timing, **metric(flops, timing, args.nvfp4_peak_tflops if mode != "bf16" else args.bf16_peak_tflops)})
     return rows
 
 
 def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, seq: int, mode: str, args: argparse.Namespace) -> dict[str, Any]:
-    measured_layer = copy.deepcopy(layer) if mode == "nvfp4" else layer
+    measured_layer = copy.deepcopy(layer) if mode != "bf16" else layer
     replaced = (
         replace_block_with_nvfp4(
             measured_layer,
@@ -346,6 +352,8 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         if mode == "nvfp4"
         else []
     )
+    if mode == "direct_nvfp4":
+        replaced = replace_linear_with_direct_nvfp4(measured_layer, set(PROJECTIONS))
     if mode == "nvfp4" and args.fuse_rmsnorm_quant:
         if args.activation_layout != "rowwise":
             raise ValueError("--fuse-rmsnorm-quant requires --activation-layout rowwise")
@@ -369,7 +377,7 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         "scope": "transformer",
         "mode": mode,
         "activation_pack_backend": (
-            args.activation_pack_backend if mode == "nvfp4" else None
+            args.activation_pack_backend if mode == "nvfp4" else ("te_direct" if mode == "direct_nvfp4" else None)
         ),
         "fuse_rmsnorm_quant": mode == "nvfp4" and args.fuse_rmsnorm_quant,
         "dual_fp4_fusion": mode == "nvfp4" and not args.disable_dual_fp4_fusion,
@@ -381,7 +389,7 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         **metric(
             flops,
             timing,
-            args.nvfp4_peak_tflops if mode == "nvfp4" else args.bf16_peak_tflops,
+            args.nvfp4_peak_tflops if mode != "bf16" else args.bf16_peak_tflops,
         ),
     }
 
