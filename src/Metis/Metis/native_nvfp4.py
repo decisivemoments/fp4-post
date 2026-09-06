@@ -23,6 +23,9 @@ from .centered_nvfp4 import (
     fused_mean_and_quantize_centered_rowwise,
     quantize_centered_rowwise,
 )
+from .rmsnorm_nvfp4 import (
+    fused_rmsnorm_mean_and_quantize_centered_rowwise,
+)
 
 
 NVFP4_BLOCK_SIZE = 16
@@ -229,6 +232,42 @@ class PackedMeanActivation:
                         )
             else:
                 raise ValueError(f"Unknown activation pack backend: {pack_backend}")
+        return cls(
+            mean=mean,
+            quantized_residual=quantized,
+            rows=rows,
+            packed_rows=packed_rows,
+            columns=columns,
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def from_rmsnorm_tensor(
+        cls,
+        value: torch.Tensor,
+        rms_weight: torch.Tensor,
+        eps: float,
+    ) -> "PackedMeanActivation":
+        """Pack Qwen RMSNorm(value) without materializing its BF16 output."""
+        flat = value.reshape(-1, value.shape[-1]).contiguous()
+        rows, columns = flat.shape
+        packed_rows = math.ceil(rows / NVFP4_WGRAD_ROW_ALIGNMENT)
+        packed_rows *= NVFP4_WGRAD_ROW_ALIGNMENT
+        _validate_native_shape(packed_rows, columns, label="RMSNorm activation")
+        if packed_rows != rows:
+            raise ValueError(
+                "fused RMSNorm NVFP4 v1 does not support activation padding"
+            )
+        with _native_profile_range("native_nvfp4.rmsnorm_mean_and_pack"):
+            quantizer = _get_quantizer(
+                value.device,
+                stochastic_rounding=False,
+                rowwise=True,
+                columnwise=False,
+            )
+            mean, quantized = fused_rmsnorm_mean_and_quantize_centered_rowwise(
+                flat, rms_weight, eps, quantizer
+            )
         return cls(
             mean=mean,
             quantized_residual=quantized,
@@ -771,15 +810,23 @@ class NativeFullNVFP4Linear(nn.Module):
         self.clear_native_cache()
         return super()._apply(fn, recurse=recurse)
 
-    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+    def _forward_with_packed_activation(
+        self,
+        input_: torch.Tensor,
+        packed_activation: PackedMeanActivation,
+    ) -> torch.Tensor:
+        """Run the native projection using a caller-owned packed activation."""
+        if packed_activation.columns != self.in_features:
+            raise ValueError(
+                "packed activation columns do not match linear in_features"
+            )
+        if packed_activation.rows != input_.reshape(-1, input_.shape[-1]).shape[0]:
+            raise ValueError("packed activation rows do not match input")
         if self.lowrank_compute == "nvfp4" and torch.is_grad_enabled():
             raise RuntimeError(
                 "lowrank_compute='nvfp4' is inference-only; use "
                 "torch.inference_mode() or select lowrank_compute='bf16'"
             )
-        if input_.dtype != torch.bfloat16:
-            input_ = input_.to(torch.bfloat16)
-        packed_activation = self.activation_group.get(input_)
         packed_residual = self._get_packed_weight(
             "residual",
             self.residual_weight,
@@ -804,6 +851,27 @@ class NativeFullNVFP4Linear(nn.Module):
             self.stochastic_rounding,
             self.lowrank_compute,
         )
+
+    def forward_from_packed_activation(
+        self,
+        input_: torch.Tensor,
+        packed_activation: PackedMeanActivation,
+    ) -> torch.Tensor:
+        """Inference-only group entry point that avoids activation repacking."""
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "forward_from_packed_activation is inference-only; use "
+                "torch.inference_mode()"
+            )
+        if input_.dtype != torch.bfloat16:
+            raise ValueError("packed-activation input shape carrier must be BF16")
+        return self._forward_with_packed_activation(input_, packed_activation)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if input_.dtype != torch.bfloat16:
+            input_ = input_.to(torch.bfloat16)
+        packed_activation = self.activation_group.get(input_)
+        return self._forward_with_packed_activation(input_, packed_activation)
 
     @torch.no_grad()
     def reconstructed_weight(self) -> torch.Tensor:

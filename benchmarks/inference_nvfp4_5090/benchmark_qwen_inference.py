@@ -34,6 +34,9 @@ from Metis.Metis.native_nvfp4 import (  # noqa: E402
     require_native_nvfp4,
     set_native_nvfp4_profiling,
 )
+from Metis.Metis.qwen2_block_nvfp4 import (  # noqa: E402
+    fuse_qwen2_decoder_layer_norms,
+)
 
 
 MODEL_IDS = {
@@ -120,6 +123,14 @@ def arguments() -> argparse.Namespace:
         "--cuda-profiler-range",
         action="store_true",
         help="Bracket measured iterations with cudaProfilerStart/Stop for Nsight Systems.",
+    )
+    parser.add_argument(
+        "--fuse-rmsnorm-quant",
+        action="store_true",
+        help=(
+            "For NVFP4 transformer scope, route Qwen RMSNorm directly into "
+            "the shared Q/K/V and Gate/Up centered activation packs."
+        ),
     )
     return parser.parse_args()
 
@@ -323,6 +334,14 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         if mode == "nvfp4"
         else []
     )
+    if mode == "nvfp4" and args.fuse_rmsnorm_quant:
+        if args.activation_layout != "rowwise":
+            raise ValueError("--fuse-rmsnorm-quant requires --activation-layout rowwise")
+        if args.activation_pack_backend != "centered_cuda":
+            raise ValueError(
+                "--fuse-rmsnorm-quant requires --activation-pack-backend centered_cuda"
+            )
+        measured_layer = fuse_qwen2_decoder_layer_norms(measured_layer)
     hidden, kwargs = block_inputs(model, model.config, batch, seq, args.device)
     timing = time_cuda(
         lambda: call_layer(measured_layer, hidden, kwargs),
@@ -340,6 +359,7 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
         "activation_pack_backend": (
             args.activation_pack_backend if mode == "nvfp4" else None
         ),
+        "fuse_rmsnorm_quant": mode == "nvfp4" and args.fuse_rmsnorm_quant,
         "batch_size": batch,
         "seq_length": seq,
         "layer_index": args.layer_index,
@@ -424,6 +444,8 @@ def main() -> None:
         raise ValueError("--projections is valid only with --scope linear")
     if args.scope != "linear" and args.activation_pack_backends is not None:
         raise ValueError("--activation-pack-backends is valid only with --scope linear")
+    if args.fuse_rmsnorm_quant and args.scope != "transformer":
+        raise ValueError("--fuse-rmsnorm-quant is valid only with --scope transformer")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.manual_seed(20260902)
     set_native_nvfp4_profiling(args.profile_native_ranges)
@@ -443,7 +465,7 @@ def main() -> None:
                     results.extend(benchmark_projection(layer, batch, args.seq_length, mode, args))
             else:
                 results.append(benchmark_block(model, layer, batch, args.seq_length, mode, args))
-    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "lowrank_compute": args.lowrank_compute, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backends": args.activation_pack_backends or [args.activation_pack_backend], "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results), "backend_comparisons": backend_comparisons(results)}
+    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "lowrank_compute": args.lowrank_compute, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backends": args.activation_pack_backends or [args.activation_pack_backend], "fuse_rmsnorm_quant": args.fuse_rmsnorm_quant, "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results), "backend_comparisons": backend_comparisons(results)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps(payload, indent=2))

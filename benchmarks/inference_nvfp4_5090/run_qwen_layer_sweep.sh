@@ -29,6 +29,7 @@ PROFILE_PROJECTIONS="${PROFILE_PROJECTIONS:-down_proj up_proj}"
 # first so a failed experimental TE layout does not hide the baseline trace.
 PROFILE_ACTIVATION_LAYOUTS="${PROFILE_ACTIVATION_LAYOUTS:-rowwise}"
 LOWRANK_COMPUTE="${LOWRANK_COMPUTE:-nvfp4}"
+FUSE_RMSNORM_QUANT="${FUSE_RMSNORM_QUANT:-0}"
 NSYS_BIN="${NSYS_BIN:-nsys}"
 QUANT_BACKEND="${QUANT_BACKEND:-centered_cuda}"
 # Nsight Systems GPU metrics are optional: unlike the CUDA/NVTX timeline they
@@ -134,6 +135,10 @@ for model in qwen0.5b; do
   if [[ -n "${model_path}" ]]; then path_args=(--model-path "${model_path}"); fi
   if [[ "${RUN_SWEEP}" == "1" ]]; then
     for scope in linear transformer; do
+      fuse_rmsnorm_args=()
+      if [[ "${scope}" == "transformer" && "${FUSE_RMSNORM_QUANT}" == "1" ]]; then
+        fuse_rmsnorm_args=(--fuse-rmsnorm-quant)
+      fi
       PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" python "${ROOT}/benchmarks/inference_nvfp4_5090/benchmark_qwen_inference.py" \
         --scope "${scope}" --model "${model}" "${path_args[@]}" \
         --seq-length "${SEQ_LENGTH}" --batch-sizes ${BATCH_SIZES} \
@@ -141,7 +146,8 @@ for model in qwen0.5b; do
         --warmup "${WARMUP}" --iterations "${ITERATIONS}" \
         --output "${OUTPUT_ROOT}/${scope}_${model}.json" \
         --activation-pack-backend "${QUANT_BACKEND}" \
-        --activation-layout "${PROFILE_ACTIVATION_LAYOUTS}"
+        --activation-layout "${PROFILE_ACTIVATION_LAYOUTS}" \
+        "${fuse_rmsnorm_args[@]}"
     done
   fi
 
