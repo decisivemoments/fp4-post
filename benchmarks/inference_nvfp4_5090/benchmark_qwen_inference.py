@@ -132,6 +132,14 @@ def arguments() -> argparse.Namespace:
             "the shared Q/K/V and Gate/Up centered activation packs."
         ),
     )
+    parser.add_argument(
+        "--disable-dual-fp4-fusion",
+        action="store_true",
+        help=(
+            "Keep the legacy TE beta=1 residual/low-rank two-GEMM path. "
+            "This is a controlled baseline for dual-FP4 fusion."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -248,6 +256,7 @@ def replace_block_with_nvfp4(
     activation_layout: str,
     lowrank_compute: str,
     activation_pack_backend: str,
+    enable_dual_fp4_fusion: bool,
 ) -> list[str]:
     require_native_nvfp4()
     return replace_linear_with_native_full_nvfp4(
@@ -257,6 +266,7 @@ def replace_block_with_nvfp4(
         activation_columnwise=activation_layout == "full",
         lowrank_compute=lowrank_compute,
         activation_pack_backend=activation_pack_backend,
+        enable_dual_fp4_fusion=enable_dual_fp4_fusion,
     )
 
 
@@ -304,6 +314,7 @@ def benchmark_projection(
             activation_layout=args.activation_layout,
             lowrank_compute=args.lowrank_compute,
             activation_pack_backend=activation_pack_backend or args.activation_pack_backend,
+            enable_dual_fp4_fusion=not args.disable_dual_fp4_fusion,
         )
     rows = []
     for name, projection in projection_modules(measured_layer).items():
@@ -330,6 +341,7 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
             activation_layout=args.activation_layout,
             lowrank_compute=args.lowrank_compute,
             activation_pack_backend=args.activation_pack_backend,
+            enable_dual_fp4_fusion=not args.disable_dual_fp4_fusion,
         )
         if mode == "nvfp4"
         else []
@@ -360,6 +372,7 @@ def benchmark_block(model: torch.nn.Module, layer: torch.nn.Module, batch: int, 
             args.activation_pack_backend if mode == "nvfp4" else None
         ),
         "fuse_rmsnorm_quant": mode == "nvfp4" and args.fuse_rmsnorm_quant,
+        "dual_fp4_fusion": mode == "nvfp4" and not args.disable_dual_fp4_fusion,
         "batch_size": batch,
         "seq_length": seq,
         "layer_index": args.layer_index,
@@ -465,7 +478,7 @@ def main() -> None:
                     results.extend(benchmark_projection(layer, batch, args.seq_length, mode, args))
             else:
                 results.append(benchmark_block(model, layer, batch, args.seq_length, mode, args))
-    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "lowrank_compute": args.lowrank_compute, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backends": args.activation_pack_backends or [args.activation_pack_backend], "fuse_rmsnorm_quant": args.fuse_rmsnorm_quant, "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results), "backend_comparisons": backend_comparisons(results)}
+    payload = {"benchmark": "qwen_one_layer_inference", "scope": args.scope, "model": args.model, "model_source": str(args.model_path or MODEL_IDS[args.model]), "config": {"hidden_size": config.hidden_size, "intermediate_size": config.intermediate_size, "num_attention_heads": config.num_attention_heads, "num_key_value_heads": config.num_key_value_heads}, "peak_tflops": {"bf16_dense": args.bf16_peak_tflops, "nvfp4_dense": args.nvfp4_peak_tflops}, "rank": args.rank, "lowrank_compute": args.lowrank_compute, "activation_mode": args.activation_mode, "activation_layout": args.activation_layout, "activation_pack_backends": args.activation_pack_backends or [args.activation_pack_backend], "fuse_rmsnorm_quant": args.fuse_rmsnorm_quant, "dual_fp4_fusion": not args.disable_dual_fp4_fusion, "profile_native_ranges": args.profile_native_ranges, "cuda_profiler_range": args.cuda_profiler_range, "results": results, "paired_speedups": paired_speedups(results), "backend_comparisons": backend_comparisons(results)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(json.dumps(payload, indent=2))

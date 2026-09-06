@@ -23,40 +23,42 @@ mean_ref, packed_ref = fused_mean_and_quantize_centered_rowwise(y_ref, q)
 `rowwise_scale_inv`、`amax_rowwise`。此外，完整 Qwen 0.5B layer 的“旧 native graph”和
 “fused RMSNorm graph”在同一输入/同一转换权重下输出 `torch.equal=True`。
 
-## 性能
+## 受控三组性能
 
-| 路径 | median | 对本次 fused NVFP4 |
-|---|---:|---:|
-| 本次 BF16 block | 32.802 ms | 1.640x slower |
-| 当前 native NVFP4，无 RMSNorm fusion | 23.843 ms | 1.192x slower |
-| 新 RMSNorm-fused native NVFP4 | **20.002 ms** | 1.000x |
-| 历史 native NVFP4 记录（无 commit provenance） | 23.947 ms | 1.197x slower |
+| 路径 | dual-FP4 | RMSNorm→quant | median | 相对优化版 |
+|---|---|---|---:|---:|
+| 完全 BF16 block | — | — | 32.819 ms | 1.640x slower |
+| legacy native NVFP4 | off | off | 28.024 ms | 1.401x slower |
+| 优化 native NVFP4 | on | on | **20.005 ms** | 1.000x |
 
-因此新融合相对同次运行、无 RMSNorm fusion 的当前 native NVFP4：
+三个命令使用同一 RTX 5090、同一模型、batch=256、seq=512、rowwise centered activation、
+rank=64、warmup=5、20 CUDA-event samples。legacy 组显式传
+`--disable-dual-fp4-fusion`，因而强制回退到 residual FP4 GEMM 后由 TE low-rank NVFP4
+`beta=1` 累加的两-GEMM 路径。
 
-```text
-23.843 / 20.002 = 1.192x speedup
-latency reduction = 16.1%
-```
-
-相对用户指定的历史结果
-[`transformer_qwen0.5b.json`](../outputs/inference_nvfp4_5090/transformer_qwen0.5b.json) 的
-batch=256 NVFP4 median 23.947 ms：
+优化版相对 legacy native NVFP4：
 
 ```text
-23.947 / 20.002 = 1.197x speedup
-latency reduction = 16.5%
+28.024 / 20.005 = 1.401x speedup
+latency reduction = 28.6%
 ```
 
-该 JSON 未记录 git SHA 或 kernel dispatch；但 dual-FP4 mean-correction 的 NCU 结果在
-2026-09-06 14:37 已生成，而 JSON 的文件时间为 15:21，且它与本次“已启用 dual、未融合
-RMSNorm”的 23.843 ms 仅相差 0.4%。因此它很可能已经包含 dual-FP4，不能作为
-“未优化 dual GEMM”的对照。双路径的公平隔离对照是本次 23.843 ms 与 20.002 ms。
-本次 BF16 32.802 ms 与历史 BF16 33.204 ms 接近，说明历史比较没有明显的环境量级偏差。
+优化版相对完全 BF16：
+
+```text
+32.819 / 20.005 = 1.640x speedup
+```
+
+历史 `transformer_qwen0.5b.json` 的 NVFP4 23.947 ms 没有 commit/kernel-dispatch
+provenance，且晚于 dual-FP4 结果生成时间，故不再用它判断 dual-FP4 的收益。
+本次 BF16 32.819 ms 与历史 BF16 33.204 ms 接近，说明测试环境量级稳定。
 结果 JSON 分别为：
 
 - `outputs/inference_nvfp4_5090/transformer_qwen0.5b_rmsnorm_fused_b256.json`
 - `outputs/inference_nvfp4_5090/transformer_qwen0.5b_dual_fp4_no_rmsnorm_fusion_b256.json`
+- `outputs/inference_nvfp4_5090/transformer_qwen0.5b_control_bf16_b256.json`
+- `outputs/inference_nvfp4_5090/transformer_qwen0.5b_control_legacy_nvfp4_b256.json`
+- `outputs/inference_nvfp4_5090/transformer_qwen0.5b_control_dual_rmsnorm_b256.json`
 
 ## 复现
 

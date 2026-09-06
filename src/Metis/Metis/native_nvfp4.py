@@ -465,6 +465,7 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
         packed_u_weight: Optional[PackedNVFP4Weight],
         stochastic_rounding: bool,
         lowrank_compute: str,
+        enable_dual_fp4_fusion: bool,
     ) -> torch.Tensor:
         input_shape = tuple(input_.shape)
         # The dual-FP4 fusion consumes the centered activation residual and
@@ -474,6 +475,7 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
         # Unsupported shapes retain the existing TE beta=1 path below.
         use_dual_fp4_fusion = (
             lowrank_compute == "nvfp4"
+            and enable_dual_fp4_fusion
             # The custom collective is an SM120 rank-64 kernel with fixed
             # 128x128 output tiles and a 64-wide K granularity.
             and torch.cuda.get_device_capability(input_.device) == (12, 0)
@@ -650,6 +652,7 @@ class _NativeFullNVFP4Function(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -669,6 +672,7 @@ class NativeFullNVFP4Linear(nn.Module):
         activation_columnwise: bool = True,
         activation_pack_backend: str = "te",
         lowrank_compute: str = "bf16",
+        enable_dual_fp4_fusion: bool = True,
     ) -> None:
         super().__init__()
         require_native_nvfp4()
@@ -698,6 +702,7 @@ class NativeFullNVFP4Linear(nn.Module):
         self.rank = rank
         self.stochastic_rounding = stochastic_rounding
         self.lowrank_compute = lowrank_compute
+        self.enable_dual_fp4_fusion = enable_dual_fp4_fusion
         self.residual_weight = nn.Parameter(
             torch.empty(out_features, in_features, device=device, dtype=dtype)
         )
@@ -744,6 +749,7 @@ class NativeFullNVFP4Linear(nn.Module):
         activation_columnwise: bool = True,
         activation_pack_backend: str = "te",
         lowrank_compute: str = "bf16",
+        enable_dual_fp4_fusion: bool = True,
     ) -> "NativeFullNVFP4Linear":
         module = cls(
             linear.in_features,
@@ -756,6 +762,7 @@ class NativeFullNVFP4Linear(nn.Module):
             activation_columnwise=activation_columnwise,
             activation_pack_backend=activation_pack_backend,
             lowrank_compute=lowrank_compute,
+            enable_dual_fp4_fusion=enable_dual_fp4_fusion,
         )
         weight_fp32 = linear.weight.detach().to(torch.float32)
         u, singular_values, vh = torch.linalg.svd(
@@ -850,6 +857,7 @@ class NativeFullNVFP4Linear(nn.Module):
             packed_u,
             self.stochastic_rounding,
             self.lowrank_compute,
+            self.enable_dual_fp4_fusion,
         )
 
     def forward_from_packed_activation(
@@ -883,7 +891,8 @@ class NativeFullNVFP4Linear(nn.Module):
         return (
             f"in_features={self.in_features}, out_features={self.out_features}, "
             f"rank={self.rank}, native_nvfp4=True, "
-            f"lowrank_compute={self.lowrank_compute}"
+            f"lowrank_compute={self.lowrank_compute}, "
+            f"dual_fp4_fusion={self.enable_dual_fp4_fusion}"
         )
 
 
@@ -896,6 +905,7 @@ def replace_linear_with_native_full_nvfp4(
     activation_columnwise: bool = True,
     activation_pack_backend: str = "te",
     lowrank_compute: str = "bf16",
+    enable_dual_fp4_fusion: bool = True,
 ) -> list[str]:
     """Replace selected Qwen projections and return their fully qualified names."""
     targets = set(target_modules or DEFAULT_TARGET_MODULES)
@@ -916,6 +926,7 @@ def replace_linear_with_native_full_nvfp4(
             activation_columnwise=activation_columnwise,
             activation_pack_backend=activation_pack_backend,
             lowrank_compute=lowrank_compute,
+            enable_dual_fp4_fusion=enable_dual_fp4_fusion,
         )
         native_layer.layer_name = name
 
